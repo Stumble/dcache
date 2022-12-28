@@ -1,0 +1,7 @@
+* DCache
+A full-featured 2-layer (mem-redis) cache implementation.
++ Cache penetration protection: empty values can also be cached.
++ Cache breakdown: single-query-in-flight.
++ Redis network IO pressure: memory cache with Redis queue events for invalidation.
++ Prometheus
++ TODO: OpenTelementry (previously OpenTracing).
