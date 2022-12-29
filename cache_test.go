@@ -216,8 +216,16 @@ func (suite *testSuite) TestPopulateCacheWithExpire() {
 	queryKey2 := "test2"
 	v1 := "testvalue1s"
 	v2 := "testvalue2s"
-	v1ct := time.Second
-	v2ct := time.Second * 2
+	// XXX(yumin): using 1 second will make this test interestingly flaky due
+	// to a precision issue. If you change v1ct back to 1 second and do
+	// `$ while go test -v ; do :; done`
+	// after some time, you will get a test failure when wall time is something like
+	// xx:yy:22.950. The reason is because of the precision of freecache is of seconds,
+	// and when you set value with TTL of 1 second,
+	// it will record the expiration time to be xx::yy::23, which means that the actual
+	// TTL is 50ms, instead of 1 second.
+	v1ct := time.Second * 2
+	v2ct := time.Second * 3
 	ev1 := suite.encodeByte(v1)
 	ev2 := suite.encodeByte(v2)
 
@@ -256,11 +264,11 @@ func (suite *testSuite) TestPopulateCacheWithExpire() {
 	suite.NoError(e)
 	suite.Equal(ev2, vinmem)
 
-	time.Sleep(time.Second)
+	time.Sleep(time.Second * 2)
 
-	// // get v1, not exist
-	// redisExist := suite.redisConn.Exists(ctx, ttl(queryKey1)).Val()
-	// suite.EqualValues(redisExist, 0)
+	// get v1, not exist
+	redisExist := suite.redisConn.Exists(ctx, storeKey(queryKey1)).Val()
+	suite.EqualValues(redisExist, 0)
 
 	_, e = suite.inMemCache.Get([]byte(storeKey(queryKey1)))
 	suite.Error(e)
