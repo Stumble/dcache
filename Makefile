@@ -23,3 +23,12 @@ test-cmd:
 
 test: test-start-all
 	GO111MODULE=$(GO111MODULE) make test-cmd && make test-stop-all || (make test-stop-all; exit 2)
+
+.PHONY: lint lint-fix
+lint:
+	@echo "--> Running linter"
+	@golangci-lint run
+
+lint-fix:
+	@echo "--> Running linter auto fix"
+	@golangci-lint run --fix

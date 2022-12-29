@@ -113,7 +113,7 @@ type MetricSet struct {
 }
 
 var (
-	hitLables      = []string{"hit"}
+	hitLabels      = []string{"hit"}
 	hitLabelMemory = "mem"
 	hitLabelRedis  = "redis"
 	hitLabelDB     = "db"
@@ -121,9 +121,10 @@ var (
 	latencyBucket = []float64{
 		1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}
 	// errors
-	errLables          = []string{"when"}
-	errLableSetCache   = "set_cache"
-	errLableInvalidate = "invalidate_error"
+	errLabels           = []string{"when"}
+	errLabelSetRedis    = "set_redis"
+	errLabelSetMemCache = "set_mem_cache"
+	errLabelInvalidate  = "invalidate_error"
 )
 
 // Client implements cache.
@@ -160,20 +161,20 @@ func NewCache(
 			prometheus.CounterOpts{
 				Name: fmt.Sprintf("%s_dcache_hit_total", appName),
 				Help: "how many hits of 3 different operations: {mem, redis, db}.",
-			}, hitLables),
+			}, hitLabels),
 		Latency: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
 				Name:    fmt.Sprintf("%s_dcache_latency_ms", appName),
 				Help:    "Cache read latency in ms",
 				Buckets: latencyBucket,
-			}, hitLables),
+			}, hitLabels),
 		Error: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: fmt.Sprintf("%s_dcache_error_total", appName),
 				Help: "how many internal errors happened",
-			}, hitLables),
+			}, errLabels),
 	}
-	if (enableStats) {
+	if enableStats {
 		err := prometheus.Register(stats.Hit)
 		if err != nil {
 			log.Err(err).Msgf("failed to register prometheus Hit counters")
@@ -274,6 +275,7 @@ func (c *Client) readValue(
 		err := c.setKey(ctx, key, valueBytes, valTtl.Ttl)
 		if err != nil {
 			log.Err(err).Msgf("Failed to set Redis cache for %s", key)
+			c.stats.Error.WithLabelValues(errLabelSetRedis).Inc()
 		}
 	}
 	return valueBytes, nil
@@ -310,6 +312,7 @@ func (c *Client) updateMemoryCache(key string, ve *ValueBytesExpiredAt) {
 		err = c.inMemCache.Set([]byte(storeKey(key)), ve.ValueBytes, int(ttl))
 		if err != nil {
 			log.Err(err).Msgf("Failed to set memory cache for key %s", storeKey(key))
+			c.stats.Error.WithLabelValues(errLabelSetMemCache).Inc()
 		}
 	}
 }
@@ -388,7 +391,7 @@ func (c *Client) listenKeyInvalidate() {
 			if len(l) < 2 {
 				// Invalid payload
 				log.Warn().Msgf("Received invalidate payload %s", payload)
-				c.stats.Error.WithLabelValues(errLableInvalidate).Inc()
+				c.stats.Error.WithLabelValues(errLabelInvalidate).Inc()
 				return
 			}
 			if l[0] == c.id {
@@ -462,7 +465,10 @@ func (c *Client) GetWithTtl(ctx context.Context, key string, target any, read Re
 			// To avoid spamming Redis with SetNX requests, only one request should try to get
 			// the lock per-pod.
 			// If timeout or not cache-able error, another thread will obtain lock after sleep.
-			updated, _ := c.conn.SetNX(ctx, lockKey(key), "", c.readInterval).Result()
+			updated, err := c.conn.SetNX(ctx, lockKey(key), "", c.readInterval).Result()
+			if err != nil {
+				c.stats.Error.WithLabelValues(errLabelSetRedis).Inc()
+			}
 			if updated {
 				return c.readValue(ctx, key, read, noStore)
 			}

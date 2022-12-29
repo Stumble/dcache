@@ -257,6 +257,7 @@ func (suite *testSuite) TestPopulateCacheWithExpire() {
 
 	// get v2
 	redisBytes, err = suite.redisConn.Get(ctx, storeKey(queryKey2)).Bytes()
+	suite.Require().NoError(err)
 	suite.Require().NoError(msgpack.Unmarshal(redisBytes, vredis))
 	suite.Equal(ev2, vredis.ValueBytes)
 
@@ -275,6 +276,7 @@ func (suite *testSuite) TestPopulateCacheWithExpire() {
 
 	// get v2
 	redisBytes, err = suite.redisConn.Get(ctx, storeKey(queryKey2)).Bytes()
+	suite.Require().NoError(err)
 	suite.Require().NoError(msgpack.Unmarshal(redisBytes, vredis))
 	suite.Equal(ev2, vredis.ValueBytes)
 

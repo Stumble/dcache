@@ -1,4 +1,4 @@
-module github.com/stumble/needle-dcache
+module github.com/stumble/dcache
 
 go 1.19
 
