@@ -106,7 +106,7 @@ type Cache interface {
 	Close()
 }
 
-type MetricSet struct {
+type metricSet struct {
 	Hit     *prometheus.CounterVec
 	Latency *prometheus.HistogramVec
 	Error   *prometheus.CounterVec
@@ -127,12 +127,54 @@ var (
 	errLabelInvalidate  = "invalidate_error"
 )
 
+func newMetricSet(appName string) *metricSet {
+	return &metricSet{
+		Hit: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: fmt.Sprintf("%s_dcache_hit_total", appName),
+				Help: "how many hits of 3 different operations: {mem, redis, db}.",
+			}, hitLabels),
+		Latency: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    fmt.Sprintf("%s_dcache_latency_milliseconds", appName),
+				Help:    "Cache read latency in milliseconds",
+				Buckets: latencyBucket,
+			}, hitLabels),
+		Error: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: fmt.Sprintf("%s_dcache_error_total", appName),
+				Help: "how many internal errors happened",
+			}, errLabels),
+	}
+}
+
+func (m *metricSet) Register() {
+	err := prometheus.Register(m.Hit)
+	if err != nil {
+		log.Err(err).Msgf("failed to register prometheus Hit counters")
+	}
+	err = prometheus.Register(m.Latency)
+	if err != nil {
+		log.Err(err).Msgf("failed to register prometheus Latency histogram")
+	}
+	err = prometheus.Register(m.Error)
+	if err != nil {
+		log.Err(err).Msgf("failed to register prometheus Error counter")
+	}
+}
+
+func (m *metricSet) Unregister() {
+	prometheus.Unregister(m.Hit)
+	prometheus.Unregister(m.Error)
+	prometheus.Unregister(m.Latency)
+}
+
 // Client implements cache.
 type Client struct {
 	conn         redis.UniversalClient
 	readInterval time.Duration
 	group        singleflight.Group
-	stats        *MetricSet
+	stats        *metricSet
 
 	// In memory cache related
 	inMemCache     *freecache.Cache
@@ -156,37 +198,10 @@ func NewCache(
 	readInterval time.Duration,
 	enableStats bool,
 ) (Cache, error) {
-	stats := &MetricSet{
-		Hit: prometheus.NewCounterVec(
-			prometheus.CounterOpts{
-				Name: fmt.Sprintf("%s_dcache_hit_total", appName),
-				Help: "how many hits of 3 different operations: {mem, redis, db}.",
-			}, hitLabels),
-		Latency: prometheus.NewHistogramVec(
-			prometheus.HistogramOpts{
-				Name:    fmt.Sprintf("%s_dcache_latency_ms", appName),
-				Help:    "Cache read latency in ms",
-				Buckets: latencyBucket,
-			}, hitLabels),
-		Error: prometheus.NewCounterVec(
-			prometheus.CounterOpts{
-				Name: fmt.Sprintf("%s_dcache_error_total", appName),
-				Help: "how many internal errors happened",
-			}, errLabels),
-	}
+	var stats *metricSet = nil
 	if enableStats {
-		err := prometheus.Register(stats.Hit)
-		if err != nil {
-			log.Err(err).Msgf("failed to register prometheus Hit counters")
-		}
-		err = prometheus.Register(stats.Latency)
-		if err != nil {
-			log.Err(err).Msgf("failed to register prometheus Latency histogram")
-		}
-		err = prometheus.Register(stats.Error)
-		if err != nil {
-			log.Err(err).Msgf("failed to register prometheus Error counter")
-		}
+		stats = newMetricSet(appName)
+		stats.Register()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -227,15 +242,17 @@ func (c *Client) Close() {
 	c.wg.Wait() // wait aggregateSend and listenKeyValidate close.
 
 	// unregister after all	go routines are closed.
-	prometheus.Unregister(c.stats.Hit)
-	prometheus.Unregister(c.stats.Error)
-	prometheus.Unregister(c.stats.Latency)
+	if c.stats != nil {
+		c.stats.Unregister()
+	}
 }
 
 func (c *Client) recordLatency(label string, startedAt time.Time) func() {
 	return func() {
-		c.stats.Latency.WithLabelValues(label).Observe(
-			float64(getNow().UnixMilli() - startedAt.UnixMilli()))
+		if c.stats != nil {
+			c.stats.Latency.WithLabelValues(label).Observe(
+				float64(getNow().UnixMilli() - startedAt.UnixMilli()))
+		}
 	}
 }
 
@@ -253,7 +270,9 @@ func (c *Client) readValue(
 	// when cache is used, call to this function is protected by a distributed lock.
 	rv, err, _ := c.group.Do(key, func() (any, error) {
 		defer c.recordLatency(hitLabelDB, getNow())()
-		defer c.stats.Hit.WithLabelValues(hitLabelDB).Inc()
+		if c.stats != nil {
+			c.stats.Hit.WithLabelValues(hitLabelDB).Inc()
+		}
 		// c.stats.
 		dbres, ttl, err := f()
 		return &valueTtl{
@@ -275,7 +294,9 @@ func (c *Client) readValue(
 		err := c.setKey(ctx, key, valueBytes, valTtl.Ttl)
 		if err != nil {
 			log.Err(err).Msgf("Failed to set Redis cache for %s", key)
-			c.stats.Error.WithLabelValues(errLabelSetRedis).Inc()
+			if c.stats != nil {
+				c.stats.Error.WithLabelValues(errLabelSetRedis).Inc()
+			}
 		}
 	}
 	return valueBytes, nil
@@ -312,7 +333,10 @@ func (c *Client) updateMemoryCache(key string, ve *ValueBytesExpiredAt) {
 		err = c.inMemCache.Set([]byte(storeKey(key)), ve.ValueBytes, int(ttl))
 		if err != nil {
 			log.Err(err).Msgf("Failed to set memory cache for key %s", storeKey(key))
-			c.stats.Error.WithLabelValues(errLabelSetMemCache).Inc()
+
+			if c.stats != nil {
+				c.stats.Error.WithLabelValues(errLabelSetMemCache).Inc()
+			}
 		}
 	}
 }
@@ -391,7 +415,10 @@ func (c *Client) listenKeyInvalidate() {
 			if len(l) < 2 {
 				// Invalid payload
 				log.Warn().Msgf("Received invalidate payload %s", payload)
-				c.stats.Error.WithLabelValues(errLabelInvalidate).Inc()
+
+				if c.stats != nil {
+					c.stats.Error.WithLabelValues(errLabelInvalidate).Inc()
+				}
 				return
 			}
 			if l[0] == c.id {
@@ -437,7 +464,10 @@ func (c *Client) GetWithTtl(ctx context.Context, key string, target any, read Re
 	if c.inMemCache != nil {
 		targetBytes, err := c.inMemCache.Get([]byte(storeKey(key)))
 		if err == nil {
-			c.stats.Hit.WithLabelValues(hitLabelMemory).Inc()
+
+			if c.stats != nil {
+				c.stats.Hit.WithLabelValues(hitLabelMemory).Inc()
+			}
 			// TODO(yumin): test if not pointer target gives a good error message.
 			return unmarshal(targetBytes, target)
 		}
@@ -454,7 +484,10 @@ func (c *Client) GetWithTtl(ctx context.Context, key string, target any, read Re
 			}
 			if e == nil {
 				// Value was retrieved from Redis, backfill memory cache and return.
-				c.stats.Hit.WithLabelValues(hitLabelRedis).Inc()
+
+				if c.stats != nil {
+					c.stats.Hit.WithLabelValues(hitLabelRedis).Inc()
+				}
 				c.recordLatency(hitLabelRedis, startedAt)
 				if !noStore {
 					c.updateMemoryCache(key, ve)
@@ -467,7 +500,10 @@ func (c *Client) GetWithTtl(ctx context.Context, key string, target any, read Re
 			// If timeout or not cache-able error, another thread will obtain lock after sleep.
 			updated, err := c.conn.SetNX(ctx, lockKey(key), "", c.readInterval).Result()
 			if err != nil {
-				c.stats.Error.WithLabelValues(errLabelSetRedis).Inc()
+
+				if c.stats != nil {
+					c.stats.Error.WithLabelValues(errLabelSetRedis).Inc()
+				}
 			}
 			if updated {
 				return c.readValue(ctx, key, read, noStore)
