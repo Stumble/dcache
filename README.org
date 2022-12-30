@@ -4,4 +4,8 @@ A full-featured 2-layer (mem-redis) cache implementation.
 + Cache breakdown: single-query-in-flight.
 + Redis network IO pressure: memory cache with Redis queue events for invalidation.
 + Prometheus
-+ TODO: OpenTelementry (previously OpenTracing).
++ TODO: OpenTelementry (or OpenTracing, the legacy version).
+
+** Known Issue
+*** Cached nil value will not overwrite target
+see TestCachedNilNotOverwriteTarget.

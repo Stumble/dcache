@@ -210,6 +210,43 @@ func (suite *testSuite) TestPopulateCache() {
 	suite.Equal(ev, vinmem2)
 }
 
+func (suite *testSuite) TestCachePenetration() {
+	ctx := context.Background()
+	queryKey := "test"
+	var vget *string = nil
+	suite.mockRepo.On("ReadThrough").Return(nil, nil).Once()
+	err := suite.cacheRepo.Get(
+		ctx, queryKey, vget, Normal.ToDuration(), func() (interface{}, error) {
+			return suite.mockRepo.ReadThrough()
+		}, false, false)
+	suite.NoError(err)
+	suite.Equal((*string)(nil), vget)
+
+	// second time should not penetrate cache.
+	err = suite.cacheRepo.Get(
+		ctx, queryKey, vget, Normal.ToDuration(), func() (interface{}, error) {
+			return suite.mockRepo.ReadThrough()
+		}, false, false)
+	suite.NoError(err)
+	suite.Equal((*string)(nil), vget)
+}
+
+func (suite *testSuite) TestCachedNilNotOverwriteTarget() {
+	ctx := context.Background()
+	queryKey := "test"
+	vget := "previous_value"
+	suite.mockRepo.On("ReadThrough").Return(nil, nil).Once()
+	err := suite.cacheRepo.Get(
+		ctx, queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
+			return suite.mockRepo.ReadThrough()
+		}, false, false)
+	suite.NoError(err)
+
+	// This is a known issue for now...
+	suite.NotEqual((*string)(nil), vget)
+	suite.Equal("previous_value", vget)
+}
+
 func (suite *testSuite) TestPopulateCacheWithExpire() {
 	ctx := context.Background()
 	queryKey1 := "test1"

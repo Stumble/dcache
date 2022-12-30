@@ -484,7 +484,6 @@ func (c *Client) GetWithTtl(ctx context.Context, key string, target any, read Re
 			}
 			if e == nil {
 				// Value was retrieved from Redis, backfill memory cache and return.
-
 				if c.stats != nil {
 					c.stats.Hit.WithLabelValues(hitLabelRedis).Inc()
 				}
@@ -566,7 +565,6 @@ func unmarshal(b []byte, value interface{}) error {
 	if len(b) == 0 {
 		return nil
 	}
-
 	switch value := value.(type) {
 	case nil:
 		return ErrNil
