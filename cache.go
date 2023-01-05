@@ -11,6 +11,7 @@ import (
 
 	"github.com/coocood/freecache"
 	redis "github.com/go-redis/redis/v8"
+	"github.com/klauspost/compress/s2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog/log"
 	uuid "github.com/satori/go.uuid"
@@ -30,6 +31,14 @@ const (
 	redisCacheInvalidateTopic = "CacheInvalidatePubSub"
 	maxInvalidate             = 100
 	invalidateChSize          = 100
+)
+
+// compression constants
+const (
+	compressionThreshold = 64
+	timeLen              = 4
+	noCompression        = 0x0
+	s2Compression        = 0x1
 )
 
 var (
@@ -67,7 +76,7 @@ type Cache interface {
 	// cache it in both the memory and Redis by @p ttl.
 	// Inputs:
 	// @p key:     Key used in cache
-	// @p value:   Pointer to receive value.
+	// @p target:  A pointer to receive value, the value must be nil. (typed nil pointer)
 	// @p ttl:     Expiration of cache key
 	// @p read:    Actual call that hits underlying data source.
 	// @p noCache: The response value will be fetched through @p read(). The new value will be
@@ -81,7 +90,7 @@ type Cache interface {
 	// cache it in both the memory and Redis by the ttl returned in @p read.
 	// Inputs:
 	// @p key:     Key used in cache
-	// @p value:   Pointer to receive value.
+	// @p value:   A pointer to receive value, the value must be nil. (typed nil pointer)
 	// @p read:    Actual call that hits underlying data source that also returns a ttl for cache.
 	// @p noCache: The response value will be fetched through @p read(). The new value will be
 	//             cached, unless @p noStore is specified.
@@ -333,7 +342,6 @@ func (c *Client) updateMemoryCache(key string, ve *ValueBytesExpiredAt) {
 		err = c.inMemCache.Set([]byte(storeKey(key)), ve.ValueBytes, int(ttl))
 		if err != nil {
 			log.Err(err).Msgf("Failed to set memory cache for key %s", storeKey(key))
-
 			if c.stats != nil {
 				c.stats.Error.WithLabelValues(errLabelSetMemCache).Inc()
 			}
@@ -464,7 +472,6 @@ func (c *Client) GetWithTtl(ctx context.Context, key string, target any, read Re
 	if c.inMemCache != nil {
 		targetBytes, err := c.inMemCache.Get([]byte(storeKey(key)))
 		if err == nil {
-
 			if c.stats != nil {
 				c.stats.Hit.WithLabelValues(hitLabelMemory).Inc()
 			}
@@ -499,7 +506,6 @@ func (c *Client) GetWithTtl(ctx context.Context, key string, target any, read Re
 			// If timeout or not cache-able error, another thread will obtain lock after sleep.
 			updated, err := c.conn.SetNX(ctx, lockKey(key), "", c.readInterval).Result()
 			if err != nil {
-
 				if c.stats != nil {
 					c.stats.Error.WithLabelValues(errLabelSetRedis).Inc()
 				}
@@ -539,8 +545,25 @@ func (c *Client) Set(ctx context.Context, key string, val any, ttl time.Duration
 	return c.setKey(ctx, key, bs, ttl)
 }
 
-// marshal @p value into returned bytes.
-// copy from https://github.com/go-redis/cache/blob/v8/cache.go#L331 and removed compression
+// compress data with s2. Add 1 suffix byte to indicate if it is cached.
+func compress(data []byte) []byte {
+	if len(data) < compressionThreshold {
+		n := len(data) + 1
+		b := make([]byte, n, n+timeLen)
+		copy(b, data)
+		b[len(b)-1] = noCompression
+		return b
+	}
+
+	n := s2.MaxEncodedLen(len(data)) + 1
+	b := make([]byte, n, n+timeLen)
+	b = s2.Encode(b, data)
+	b = append(b, s2Compression)
+	return b
+}
+
+// marshal @p value into returned bytes, with compression.
+// copy from https://github.com/go-redis/cache/blob/v8/cache.go
 func marshal(value interface{}) ([]byte, error) {
 	switch value := value.(type) {
 	case nil:
@@ -551,18 +574,22 @@ func marshal(value interface{}) ([]byte, error) {
 		return []byte(value), nil
 	}
 
-	return msgpack.Marshal(value)
+	b, err := msgpack.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return compress(b), nil
 }
 
 // unmarshal @p b into @p value.
-// copy from https://github.com/go-redis/cache/blob/v8/cache.go#L369
+// copy from https://github.com/go-redis/cache/blob/v8/cache.go
 func unmarshal(b []byte, value interface{}) error {
 	if len(b) == 0 {
 		return nil
 	}
 	switch value := value.(type) {
 	case nil:
-		return ErrNil
+		return nil
 	case *[]byte:
 		clone := make([]byte, len(b))
 		copy(clone, b)
@@ -571,6 +598,21 @@ func unmarshal(b []byte, value interface{}) error {
 	case *string:
 		*value = string(b)
 		return nil
+	}
+
+	switch c := b[len(b)-1]; c {
+	case noCompression:
+		b = b[:len(b)-1]
+	case s2Compression:
+		b = b[:len(b)-1]
+
+		var err error
+		b, err = s2.Decode(nil, b)
+		if err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unknown compression method: %x", c)
 	}
 
 	return msgpack.Unmarshal(b, value)

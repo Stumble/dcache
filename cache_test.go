@@ -109,7 +109,8 @@ func newTestSuite() *testSuite {
 		Addr: fmt.Sprintf("127.0.0.1:6379"),
 		DB:   10,
 	})
-	inMemCache := freecache.NewCache(1024 * 1024)
+	// max value size is: 100MB / 1024 = 100KB
+	inMemCache := freecache.NewCache(100 * 1024 * 1024)
 	cacheRepo, e := NewCache("test", redisClient, inMemCache, time.Second, true)
 	if e != nil {
 		panic(e)
@@ -211,14 +212,14 @@ func (suite *testSuite) TestPopulateCache() {
 }
 
 type data struct {
-	s string
-	i int
+	S string
+	I int
 }
 
 func (suite *testSuite) TestCachePenetration() {
 	ctx := context.Background()
 	queryKey := "test"
-	var vget *data = new(data)
+	var vget *data
 	suite.mockRepo.On("ReadThrough").Return(nil, nil).Once()
 	err := suite.cacheRepo.Get(
 		ctx, queryKey, vget, Normal.ToDuration(), func() (interface{}, error) {
@@ -234,6 +235,43 @@ func (suite *testSuite) TestCachePenetration() {
 		}, false, false)
 	suite.NoError(err)
 	suite.Equal((*data)(nil), vget)
+}
+
+func (suite *testSuite) TestCacheCompressionRate() {
+	var expected []data
+	for i := 0; i < 10000; i++ {
+		expected = append(expected, data{
+			fmt.Sprintf("long string worth compression: %d", i),
+			i,
+		})
+	}
+	compressed, err := marshal(expected)
+	suite.Require().Nil(err)
+	original, err := msgpack.Marshal(expected)
+	suite.Require().Nil(err)
+	suite.LessOrEqual(len(compressed), len(original))
+	fmt.Printf("compression space saving rate: %.2f%s\n",
+		100-100*float64(len(compressed))/float64(len(original)), "%")
+}
+
+func (suite *testSuite) TestCacheCompressionValue() {
+	ctx := context.Background()
+	queryKey := "test"
+	var vget []data
+	var expected []data
+	for i := 0; i < 10000; i++ {
+		expected = append(expected, data{
+			fmt.Sprintf("long string worth compression: %d", i),
+			i,
+		})
+	}
+	suite.mockRepo.On("ReadThrough").Return(expected, nil).Once()
+	err := suite.cacheRepo.Get(
+		ctx, queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
+			return suite.mockRepo.ReadThrough()
+		}, false, false)
+	suite.NoError(err)
+	suite.Equal(expected, vget)
 }
 
 func (suite *testSuite) TestCachedNilNotOverwriteTarget() {
