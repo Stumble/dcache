@@ -551,12 +551,7 @@ func marshal(value interface{}) ([]byte, error) {
 		return []byte(value), nil
 	}
 
-	b, err := msgpack.Marshal(value)
-	if err != nil {
-		return nil, err
-	}
-
-	return b, nil
+	return msgpack.Marshal(value)
 }
 
 // unmarshal @p b into @p value.

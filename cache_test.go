@@ -210,17 +210,22 @@ func (suite *testSuite) TestPopulateCache() {
 	suite.Equal(ev, vinmem2)
 }
 
+type data struct {
+	s string
+	i int
+}
+
 func (suite *testSuite) TestCachePenetration() {
 	ctx := context.Background()
 	queryKey := "test"
-	var vget *string = nil
+	var vget *data = new(data)
 	suite.mockRepo.On("ReadThrough").Return(nil, nil).Once()
 	err := suite.cacheRepo.Get(
 		ctx, queryKey, vget, Normal.ToDuration(), func() (interface{}, error) {
 			return suite.mockRepo.ReadThrough()
 		}, false, false)
 	suite.NoError(err)
-	suite.Equal((*string)(nil), vget)
+	suite.Equal((*data)(nil), vget)
 
 	// second time should not penetrate cache.
 	err = suite.cacheRepo.Get(
@@ -228,7 +233,7 @@ func (suite *testSuite) TestCachePenetration() {
 			return suite.mockRepo.ReadThrough()
 		}, false, false)
 	suite.NoError(err)
-	suite.Equal((*string)(nil), vget)
+	suite.Equal((*data)(nil), vget)
 }
 
 func (suite *testSuite) TestCachedNilNotOverwriteTarget() {
