@@ -183,8 +183,8 @@ func (m *metricSet) Unregister() {
 	prometheus.Unregister(m.Latency)
 }
 
-// Client implements cache.
-type Client struct {
+// DCache implements cache.
+type DCache struct {
 	conn         redis.UniversalClient
 	readInterval time.Duration
 	group        singleflight.Group
@@ -202,16 +202,18 @@ type Client struct {
 	wg             sync.WaitGroup
 }
 
-// NewCache creates a new cache client with in-memory cache if not @p inMemCache not nil.
+var _ Cache = &DCache{}
+
+// NewDCache creates a new cache client with in-memory cache if not @p inMemCache not nil.
 // It will also register several Prometheus metrics to the default register.
 // @p readInterval specify the duration between each read per key.
-func NewCache(
+func NewDCache(
 	appName string,
 	primaryClient redis.UniversalClient,
 	inMemCache *freecache.Cache,
 	readInterval time.Duration,
 	enableStats bool,
-) (Cache, error) {
+) (*DCache, error) {
 	var stats *metricSet = nil
 	if enableStats {
 		stats = newMetricSet(appName)
@@ -220,11 +222,11 @@ func NewCache(
 
 	if readInterval > maxReadInterval {
 		log.Warn().Msgf("read interval might be too large, suggest: %s, got: %s ",
-			time.Duration(maxReadInterval).String(), readInterval.String())
+			maxReadInterval.String(), readInterval.String())
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Client{
+	c := &DCache{
 		conn:           primaryClient,
 		stats:          stats,
 		id:             uuid.NewV4().String(),
@@ -246,7 +248,7 @@ func NewCache(
 }
 
 // Close terminates redis pubsub gracefully
-func (c *Client) Close() {
+func (c *DCache) Close() {
 	if c.pubsub != nil {
 		err := c.pubsub.Unsubscribe(c.ctx)
 		if err != nil {
@@ -266,7 +268,7 @@ func (c *Client) Close() {
 	}
 }
 
-func (c *Client) recordLatency(label string, startedAt time.Time) func() {
+func (c *DCache) recordLatency(label string, startedAt time.Time) func() {
 	return func() {
 		if c.stats != nil {
 			c.stats.Latency.WithLabelValues(label).Observe(
@@ -277,7 +279,7 @@ func (c *Client) recordLatency(label string, startedAt time.Time) func() {
 
 // readValue read through using f and cache to @p key if no error and not @p noStore.
 // return the marshaled bytes if no error.
-func (c *Client) readValue(
+func (c *DCache) readValue(
 	ctx context.Context, key string, f ReadWithTtlFunc, noStore bool) ([]byte, error) {
 	// valueTtl is an internal helper struct that bundles value and ttl.
 	type valueTtl struct {
@@ -322,7 +324,7 @@ func (c *Client) readValue(
 }
 
 // setKey set key in redis and inMemCache
-func (c *Client) setKey(ctx context.Context, key string, valueBytes []byte, ttl time.Duration) error {
+func (c *DCache) setKey(ctx context.Context, key string, valueBytes []byte, ttl time.Duration) error {
 	ve := &ValueBytesExpiredAt{
 		ValueBytes: valueBytes,
 		ExpiredAt:  getNow().Add(ttl).UnixMilli(),
@@ -339,7 +341,7 @@ func (c *Client) setKey(ctx context.Context, key string, valueBytes []byte, ttl 
 	return nil
 }
 
-func (c *Client) updateMemoryCache(key string, ve *ValueBytesExpiredAt) {
+func (c *DCache) updateMemoryCache(key string, ve *ValueBytesExpiredAt) {
 	// update memory cache.
 	// sub-second TTL will be ignored for memory cache.
 	ttl := time.UnixMilli(ve.ExpiredAt).Unix() - getNow().Unix()
@@ -360,7 +362,7 @@ func (c *Client) updateMemoryCache(key string, ve *ValueBytesExpiredAt) {
 }
 
 // deleteKey delete key in redis and inMemCache
-func (c *Client) deleteKey(ctx context.Context, key string) {
+func (c *DCache) deleteKey(ctx context.Context, key string) {
 	c.conn.Del(ctx, storeKey(key))
 	if c.inMemCache != nil {
 		_, err := c.inMemCache.Get([]byte(storeKey(key)))
@@ -372,7 +374,7 @@ func (c *Client) deleteKey(ctx context.Context, key string) {
 }
 
 // broadcastKeyInvalidate pushes key into a list and wait for broadcast
-func (c *Client) broadcastKeyInvalidate(key string) {
+func (c *DCache) broadcastKeyInvalidate(key string) {
 	c.invalidateMu.Lock()
 	c.invalidateKeys[storeKey(key)] = struct{}{}
 	l := len(c.invalidateKeys)
@@ -384,7 +386,7 @@ func (c *Client) broadcastKeyInvalidate(key string) {
 
 // aggregateSend waits for 1 seconds or list accumulating more than maxInvalidate
 // to send to redis pubsub
-func (c *Client) aggregateSend() {
+func (c *DCache) aggregateSend() {
 	defer c.wg.Done()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -417,7 +419,7 @@ func (c *Client) aggregateSend() {
 }
 
 // listenKeyInvalidate subscribe to invalidate key requests and invalidates memory cache.
-func (c *Client) listenKeyInvalidate() {
+func (c *DCache) listenKeyInvalidate() {
 	defer c.wg.Done()
 	ch := c.pubsub.Channel()
 	for {
@@ -460,7 +462,7 @@ func lockKey(key string) string {
 }
 
 // Get implements Cache interface
-func (c *Client) Get(ctx context.Context, key string, target any, expire time.Duration, read ReadFunc, noCache bool, noStore bool) error {
+func (c *DCache) Get(ctx context.Context, key string, target any, expire time.Duration, read ReadFunc, noCache bool, noStore bool) error {
 	readWithTtl := func() (any, time.Duration, error) {
 		res, err := read()
 		return res, expire, err
@@ -470,7 +472,7 @@ func (c *Client) Get(ctx context.Context, key string, target any, expire time.Du
 }
 
 // GetWithExpire implements Cache interface
-func (c *Client) GetWithTtl(ctx context.Context, key string, target any, read ReadWithTtlFunc, noCache bool, noStore bool) error {
+func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read ReadWithTtlFunc, noCache bool, noStore bool) error {
 	if noCache {
 		targetBytes, err := c.readValue(ctx, key, read, noStore)
 		if err != nil {
@@ -541,13 +543,13 @@ func (c *Client) GetWithTtl(ctx context.Context, key string, target any, read Re
 }
 
 // Invalidate implements Cache interface
-func (c *Client) Invalidate(ctx context.Context, key string) error {
+func (c *DCache) Invalidate(ctx context.Context, key string) error {
 	c.deleteKey(ctx, key)
 	return nil
 }
 
 // Set implements Cache interface
-func (c *Client) Set(ctx context.Context, key string, val any, ttl time.Duration) error {
+func (c *DCache) Set(ctx context.Context, key string, val any, ttl time.Duration) error {
 	bs, err := marshal(val)
 	if err != nil {
 		return err
