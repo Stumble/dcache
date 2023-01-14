@@ -19,6 +19,8 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+var _ = log.Logger
+
 const (
 	lockSuffix = "_LOCK"
 	delimiter  = "~|~"
@@ -31,6 +33,9 @@ const (
 	redisCacheInvalidateTopic = "CacheInvalidatePubSub"
 	maxInvalidate             = 100
 	invalidateChSize          = 100
+
+	// the maximum read interval to warn about inappropriately large value.
+	maxReadInterval = 3 * time.Second
 )
 
 // compression constants
@@ -211,6 +216,11 @@ func NewCache(
 	if enableStats {
 		stats = newMetricSet(appName)
 		stats.Register()
+	}
+
+	if readInterval > maxReadInterval {
+		log.Warn().Msgf("read interval might be too large, suggest: %s, got: %s ",
+			time.Duration(maxReadInterval).String(), readInterval.String())
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
