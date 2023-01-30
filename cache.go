@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/coocood/freecache"
-	redis "github.com/go-redis/redis/v8"
+	"github.com/go-redis/redis/v8"
 	"github.com/klauspost/compress/s2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog/log"
@@ -118,6 +118,9 @@ type Cache interface {
 
 	// Close closes resources used by cache
 	Close()
+
+	// Ping checks if the underlying redis connection is alive
+	Ping(ctx context.Context) error
 }
 
 type metricSet struct {
@@ -245,6 +248,11 @@ func NewDCache(
 		go c.listenKeyInvalidate()
 	}
 	return c, nil
+}
+
+// Ping checks if the underlying redis connection is alive
+func (c *DCache) Ping(ctx context.Context) error {
+	return c.conn.Ping(ctx).Err()
 }
 
 // Close terminates redis pubsub gracefully
@@ -471,7 +479,7 @@ func (c *DCache) Get(ctx context.Context, key string, target any, expire time.Du
 	return c.GetWithTtl(ctx, key, target, readWithTtl, noCache, noStore)
 }
 
-// GetWithExpire implements Cache interface
+// GetWithTtl implements Cache interface
 func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read ReadWithTtlFunc, noCache bool, noStore bool) error {
 	if noCache {
 		targetBytes, err := c.readValue(ctx, key, read, noStore)
