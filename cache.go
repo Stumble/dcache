@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/coocood/freecache"
-	redis "github.com/go-redis/redis/v8"
+	"github.com/go-redis/redis/v8"
 	"github.com/klauspost/compress/s2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog/log"
@@ -127,6 +127,9 @@ type Cache interface {
 
 	// Close closes resources used by cache
 	Close()
+
+	// Ping checks if the underlying redis connection is alive
+	Ping(ctx context.Context) error
 }
 
 type metricSet struct {
@@ -198,6 +201,7 @@ type DCache struct {
 	readInterval time.Duration
 	group        singleflight.Group
 	stats        *metricSet
+	tracer       *tracer
 
 	// In memory cache related
 	inMemCache     *freecache.Cache
@@ -222,6 +226,7 @@ func NewDCache(
 	inMemCache *freecache.Cache,
 	readInterval time.Duration,
 	enableStats bool,
+	enableTracer bool,
 ) (*DCache, error) {
 	var stats *metricSet = nil
 	if enableStats {
@@ -253,7 +258,15 @@ func NewDCache(
 		go c.aggregateSend()
 		go c.listenKeyInvalidate()
 	}
+	if enableTracer {
+		c.tracer = newTracer()
+	}
 	return c, nil
+}
+
+// Ping checks if the underlying redis connection is alive
+func (c *DCache) Ping(ctx context.Context) error {
+	return c.conn.Ping(ctx).Err()
 }
 
 // Close terminates redis pubsub gracefully
@@ -477,11 +490,33 @@ func (c *DCache) Get(ctx context.Context, key string, target any, expire time.Du
 		return res, expire, err
 	}
 
+	if c.tracer != nil {
+		ctx = c.tracer.TraceStart(ctx,
+			"Get",
+			[]string{
+				fmt.Sprintf("key=%s", key),
+				fmt.Sprintf("expire=%s", expire),
+				fmt.Sprintf("noCache=%v", noCache),
+				fmt.Sprintf("noStore=%v", noStore),
+			})
+		defer c.tracer.TraceEnd(ctx, nil)
+	}
+
 	return c.GetWithTtl(ctx, key, target, readWithTtl, noCache, noStore)
 }
 
-// GetWithExpire implements Cache interface
+// GetWithTtl implements Cache interface
 func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read ReadWithTtlFunc, noCache bool, noStore bool) error {
+	if c.tracer != nil {
+		ctx = c.tracer.TraceStart(ctx,
+			"GetWithTtl",
+			[]string{
+				fmt.Sprintf("key=%s", key),
+				fmt.Sprintf("noCache=%v", noCache),
+				fmt.Sprintf("noStore=%v", noStore),
+			})
+		defer c.tracer.TraceEnd(ctx, nil)
+	}
 	if noCache {
 		targetBytes, err := c.readValue(ctx, key, read, noStore)
 		if err != nil {
@@ -553,12 +588,24 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 
 // Invalidate implements Cache interface
 func (c *DCache) Invalidate(ctx context.Context, key string) error {
+	if c.tracer != nil {
+		ctx = c.tracer.TraceStart(ctx, "Invalidate", []string{fmt.Sprintf("key=%s", key)})
+		defer c.tracer.TraceEnd(ctx, nil)
+	}
 	c.deleteKey(ctx, key)
 	return nil
 }
 
 // Set implements Cache interface
 func (c *DCache) Set(ctx context.Context, key string, val any, ttl time.Duration) error {
+	if c.tracer != nil {
+		ctx = c.tracer.TraceStart(ctx, "Set",
+			[]string{
+				fmt.Sprintf("key=%s", key),
+				fmt.Sprintf("ttl=%s", ttl),
+			})
+		defer c.tracer.TraceEnd(ctx, nil)
+	}
 	bs, err := marshal(val)
 	if err != nil {
 		return err
