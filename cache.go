@@ -373,6 +373,10 @@ func (c *DCache) updateMemoryCache(key string, ve *ValueBytesExpiredAt) {
 	ttl := time.UnixMilli(ve.ExpiredAt).Unix() - getNow().Unix()
 	if c.inMemCache != nil && ttl > 0 {
 		memValue, err := c.inMemCache.Get([]byte(storeKey(key)))
+		// Broadcast invalidation request only when	we explicitly see
+		// value changes.
+		// I would assume it shouldn't create a big storm, because if the value
+		// is cached in memory, then it should hit from there.
 		if err == nil && !bytes.Equal(ve.ValueBytes, memValue) {
 			c.broadcastKeyInvalidate(storeKey(key))
 		}
@@ -388,15 +392,18 @@ func (c *DCache) updateMemoryCache(key string, ve *ValueBytesExpiredAt) {
 }
 
 // deleteKey delete key in redis and inMemCache
-func (c *DCache) deleteKey(ctx context.Context, key string) {
-	c.conn.Del(ctx, storeKey(key))
-	if c.inMemCache != nil {
-		_, err := c.inMemCache.Get([]byte(storeKey(key)))
-		if err == nil {
+func (c *DCache) deleteKey(ctx context.Context, key string) error {
+	n, err := c.conn.Del(ctx, storeKey(key)).Result()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		if c.inMemCache != nil {
+			c.inMemCache.Del([]byte(storeKey(key)))
 			c.broadcastKeyInvalidate(key)
 		}
-		c.inMemCache.Del([]byte(storeKey(key)))
 	}
+	return nil
 }
 
 // broadcastKeyInvalidate pushes key into a list and wait for broadcast
@@ -623,13 +630,13 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 // Invalidate explicitly invalidates a cache key
 // Inputs:
 // key    - key to invalidate
-func (c *DCache) Invalidate(ctx context.Context, key string) error {
+func (c *DCache) Invalidate(ctx context.Context, key string) (err error) {
 	if c.tracer != nil {
 		ctx = c.tracer.TraceStart(ctx, "Invalidate", []string{fmt.Sprintf("key=%s", key)})
 		defer c.tracer.TraceEnd(ctx, nil)
 	}
-	c.deleteKey(ctx, key)
-	return nil
+	err = c.deleteKey(ctx, key)
+	return
 }
 
 // Set explicitly set a cache key to a val
@@ -637,20 +644,21 @@ func (c *DCache) Invalidate(ctx context.Context, key string) error {
 // key	  - key to set
 // val	  - val to set
 // ttl    - ttl of key
-func (c *DCache) Set(ctx context.Context, key string, val any, ttl time.Duration) error {
+func (c *DCache) Set(ctx context.Context, key string, val any, ttl time.Duration) (err error) {
 	if c.tracer != nil {
 		ctx = c.tracer.TraceStart(ctx, "Set",
 			[]string{
 				fmt.Sprintf("key=%s", key),
 				fmt.Sprintf("ttl=%s", ttl),
 			})
-		defer c.tracer.TraceEnd(ctx, nil)
+		defer c.tracer.TraceEnd(ctx, err)
 	}
 	bs, err := marshal(val)
 	if err != nil {
-		return err
+		return
 	}
-	return c.setKey(ctx, key, bs, ttl)
+	err = c.setKey(ctx, key, bs, ttl)
+	return
 }
 
 // compress data with s2. Add 1 suffix byte to indicate if it is cached.
