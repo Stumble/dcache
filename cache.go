@@ -39,6 +39,9 @@ const (
 	maxReadInterval = 3 * time.Second
 )
 
+// Hardcap for memory cache TTL, changeable for testing.
+var memCacheMaxTTLSeconds int64 = 5
+
 // compression constants
 const (
 	compressionThreshold = 64
@@ -372,6 +375,9 @@ func (c *DCache) updateMemoryCache(key string, ve *ValueBytesExpiredAt, isExplic
 	// update memory cache.
 	// sub-second TTL will be ignored for memory cache.
 	ttl := time.UnixMilli(ve.ExpiredAt).Unix() - getNow().Unix()
+	if ttl > memCacheMaxTTLSeconds {
+		ttl = memCacheMaxTTLSeconds
+	}
 	if c.inMemCache != nil && ttl > 0 {
 		memValue, err := c.inMemCache.Get([]byte(storeKey(key)))
 		// Broadcast invalidation request only when value is explicitly set to new one,
