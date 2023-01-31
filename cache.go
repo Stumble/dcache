@@ -78,7 +78,8 @@ type ValueBytesExpiredAt struct {
 	ExpiredAt  int64  `msgpack:"e,omitempty"` // UNIX timestamp in Milliseconds.
 }
 
-// Cache defines interface to cache
+// Cache interface here is only for backward compatibility.
+// It is not recommended to use this interface in your app, instead, use *DCache.
 type Cache interface {
 	// Get will read the value from cache if exists or call read() to retrieve the value and
 	// cache it in both the memory and Redis by @p ttl.
@@ -127,9 +128,6 @@ type Cache interface {
 
 	// Close closes resources used by cache
 	Close()
-
-	// Ping checks if the underlying redis connection is alive
-	Ping(ctx context.Context) error
 }
 
 type metricSet struct {
@@ -234,6 +232,11 @@ func NewDCache(
 		stats.Register()
 	}
 
+	var tracer *tracer = nil
+	if enableTracer {
+		tracer = newTracer()
+	}
+
 	if readInterval > maxReadInterval {
 		log.Warn().Msgf("read interval might be too large, suggest: %s, got: %s ",
 			maxReadInterval.String(), readInterval.String())
@@ -243,6 +246,7 @@ func NewDCache(
 	c := &DCache{
 		conn:           primaryClient,
 		stats:          stats,
+		tracer:         tracer,
 		id:             uuid.NewV4().String(),
 		invalidateKeys: make(map[string]struct{}),
 		invalidateMu:   &sync.Mutex{},
@@ -257,9 +261,6 @@ func NewDCache(
 		c.wg.Add(2)
 		go c.aggregateSend()
 		go c.listenKeyInvalidate()
-	}
-	if enableTracer {
-		c.tracer = newTracer()
 	}
 	return c, nil
 }
@@ -303,6 +304,9 @@ func (c *DCache) recordLatency(label string, startedAt time.Time) func() {
 // return the marshaled bytes if no error.
 func (c *DCache) readValue(
 	ctx context.Context, key string, f ReadWithTtlFunc, noStore bool) ([]byte, error) {
+	if c.tracer != nil {
+		c.tracer.TraceHitFrom(ctx, hitDB)
+	}
 	// valueTtl is an internal helper struct that bundles value and ttl.
 	type valueTtl struct {
 		Val any
@@ -483,30 +487,48 @@ func lockKey(key string) string {
 	return fmt.Sprintf(":%s%s", storeKey(key), lockSuffix)
 }
 
-// Get implements Cache interface
+// Get will read the value from cache if exists or call read() to retrieve the value and
+// cache it in both the memory and Redis by @p ttl.
+// Inputs:
+// @p key:     Key used in cache
+// @p value:   A pointer to the memory piece of the type of the value.
+//
+//	For example, if we are caching string, then target must be of type *string.
+//	if we caching a null-able string, using *string to represent it, then the
+//	target must be of type **string, i.e., pointer to the pointer of string.
+//
+// @p ttl:     Expiration of cache key
+// @p read:    Actual call that hits underlying data source.
+// @p noCache: The response value will be fetched through @p read(). The new value will be
+//
+//	cached, unless @p noStore is specified.
+//
+// @p noStore: The response value will not be saved into the cache.
 func (c *DCache) Get(ctx context.Context, key string, target any, expire time.Duration, read ReadFunc, noCache bool, noStore bool) error {
 	readWithTtl := func() (any, time.Duration, error) {
 		res, err := read()
 		return res, expire, err
 	}
-
-	if c.tracer != nil {
-		ctx = c.tracer.TraceStart(ctx,
-			"Get",
-			[]string{
-				fmt.Sprintf("key=%s", key),
-				fmt.Sprintf("expire=%s", expire),
-				fmt.Sprintf("noCache=%v", noCache),
-				fmt.Sprintf("noStore=%v", noStore),
-			})
-		defer c.tracer.TraceEnd(ctx, nil)
-	}
-
 	return c.GetWithTtl(ctx, key, target, readWithTtl, noCache, noStore)
 }
 
-// GetWithTtl implements Cache interface
-func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read ReadWithTtlFunc, noCache bool, noStore bool) error {
+// GetWithTtl will read the value from cache if exists or call @p read to retrieve the value and
+// cache it in both the memory and Redis by the ttl returned in @p read.
+// Inputs:
+// @p key:     Key used in cache
+// @p value:   A pointer to the memory piece of the type of the value.
+//
+//	For example, if we are caching string, then target must be of type *string.
+//	if we caching a null-able string, using *string to represent it, then the
+//	target must be of type **string, i.e., pointer to the pointer of string.
+//
+// @p read:    Actual call that hits underlying data source that also returns a ttl for cache.
+// @p noCache: The response value will be fetched through @p read(). The new value will be
+//
+//	cached, unless @p noStore is specified.
+//
+// @p noStore: The response value will not be saved into the cache.
+func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read ReadWithTtlFunc, noCache bool, noStore bool) (err error) {
 	if c.tracer != nil {
 		ctx = c.tracer.TraceStart(ctx,
 			"GetWithTtl",
@@ -515,28 +537,36 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 				fmt.Sprintf("noCache=%v", noCache),
 				fmt.Sprintf("noStore=%v", noStore),
 			})
-		defer c.tracer.TraceEnd(ctx, nil)
+		defer c.tracer.TraceEnd(ctx, err)
 	}
+
 	if noCache {
-		targetBytes, err := c.readValue(ctx, key, read, noStore)
+		var targetBytes []byte
+		targetBytes, err = c.readValue(ctx, key, read, noStore)
 		if err != nil {
-			return err
+			return
 		}
-		return unmarshal(targetBytes, target)
+		err = unmarshal(targetBytes, target)
+		return
 	}
 	// lookup in memory cache.
 	if c.inMemCache != nil {
-		targetBytes, err := c.inMemCache.Get([]byte(storeKey(key)))
+		var targetBytes []byte
+		targetBytes, err = c.inMemCache.Get([]byte(storeKey(key)))
 		if err == nil {
 			if c.stats != nil {
 				c.stats.Hit.WithLabelValues(hitLabelMemory).Inc()
 			}
-			// TODO(yumin): test if not pointer target gives a good error message.
-			return unmarshal(targetBytes, target)
+			if c.tracer != nil {
+				c.tracer.TraceHitFrom(ctx, hitMem)
+			}
+			err = unmarshal(targetBytes, target)
+			return
 		}
 	}
 
-	targetBytes, err, _ := c.group.Do(lockKey(key), func() (any, error) {
+	var anyTypedBytes any
+	anyTypedBytes, err, _ = c.group.Do(lockKey(key), func() (any, error) {
 		// distributed single flight to query db for value.
 		startedAt := getNow()
 		for {
@@ -549,6 +579,9 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 				// Value was retrieved from Redis, backfill memory cache and return.
 				if c.stats != nil {
 					c.stats.Hit.WithLabelValues(hitLabelRedis).Inc()
+				}
+				if c.tracer != nil {
+					c.tracer.TraceHitFrom(ctx, hitRedis)
 				}
 				c.recordLatency(hitLabelRedis, startedAt)
 				if !noStore {
@@ -581,12 +614,15 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 		}
 	})
 	if err != nil {
-		return err
+		return
 	}
-	return unmarshal(targetBytes.([]byte), target)
+	err = unmarshal(anyTypedBytes.([]byte), target)
+	return
 }
 
-// Invalidate implements Cache interface
+// Invalidate explicitly invalidates a cache key
+// Inputs:
+// key    - key to invalidate
 func (c *DCache) Invalidate(ctx context.Context, key string) error {
 	if c.tracer != nil {
 		ctx = c.tracer.TraceStart(ctx, "Invalidate", []string{fmt.Sprintf("key=%s", key)})
@@ -596,7 +632,11 @@ func (c *DCache) Invalidate(ctx context.Context, key string) error {
 	return nil
 }
 
-// Set implements Cache interface
+// Set explicitly set a cache key to a val
+// Inputs:
+// key	  - key to set
+// val	  - val to set
+// ttl    - ttl of key
 func (c *DCache) Set(ctx context.Context, key string, val any, ttl time.Duration) error {
 	if c.tracer != nil {
 		ctx = c.tracer.TraceStart(ctx, "Set",

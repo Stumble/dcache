@@ -111,12 +111,12 @@ func newTestSuite() *testSuite {
 	})
 	// max value size is: 100MB / 1024 = 100KB
 	inMemCache := freecache.NewCache(100 * 1024 * 1024)
-	cacheRepo, e := NewDCache("test", redisClient, inMemCache, time.Second, true)
+	cacheRepo, e := NewDCache("test", redisClient, inMemCache, time.Second, true, true)
 	if e != nil {
 		panic(e)
 	}
 	inMemCache2 := freecache.NewCache(1024 * 1024)
-	cacheRepo2, e := NewDCache("test", redisClient, inMemCache2, time.Second, false)
+	cacheRepo2, e := NewDCache("test", redisClient, inMemCache2, time.Second, false, true)
 	if e != nil {
 		panic(e)
 	}
