@@ -338,7 +338,7 @@ func (c *DCache) readValue(
 	if !noStore {
 		// If failed to set cache, we do not return error because value has been
 		// successfully retrieved.
-		err := c.setKey(ctx, key, valueBytes, valTtl.Ttl)
+		err := c.setKey(ctx, key, valueBytes, valTtl.Ttl, false)
 		if err != nil {
 			log.Err(err).Msgf("Failed to set Redis cache for %s", key)
 			if c.stats != nil {
@@ -350,7 +350,7 @@ func (c *DCache) readValue(
 }
 
 // setKey set key in redis and inMemCache
-func (c *DCache) setKey(ctx context.Context, key string, valueBytes []byte, ttl time.Duration) error {
+func (c *DCache) setKey(ctx context.Context, key string, valueBytes []byte, ttl time.Duration, isExplicitSet bool) error {
 	ve := &ValueBytesExpiredAt{
 		ValueBytes: valueBytes,
 		ExpiredAt:  getNow().Add(ttl).UnixMilli(),
@@ -363,22 +363,27 @@ func (c *DCache) setKey(ctx context.Context, key string, valueBytes []byte, ttl 
 	if err != nil {
 		return err
 	}
-	c.updateMemoryCache(key, ve)
+	c.updateMemoryCache(key, ve, isExplicitSet)
 	return nil
 }
 
-func (c *DCache) updateMemoryCache(key string, ve *ValueBytesExpiredAt) {
+// isExplicitSet = true, calling from Set. Otherwise, value is backfilled from Redis.
+func (c *DCache) updateMemoryCache(key string, ve *ValueBytesExpiredAt, isExplicitSet bool) {
 	// update memory cache.
 	// sub-second TTL will be ignored for memory cache.
 	ttl := time.UnixMilli(ve.ExpiredAt).Unix() - getNow().Unix()
 	if c.inMemCache != nil && ttl > 0 {
 		memValue, err := c.inMemCache.Get([]byte(storeKey(key)))
-		// Broadcast invalidation request only when	we explicitly see
-		// value changes.
-		// I would assume it shouldn't create a big storm, because if the value
-		// is cached in memory, then it should hit from there.
-		if err == nil && !bytes.Equal(ve.ValueBytes, memValue) {
-			c.broadcastKeyInvalidate(storeKey(key))
+		// Broadcast invalidation request only when value is explicitly set to new one,
+		// by Set(), instead of backfilled from Redis, and if
+		// (1) The value does not exist before
+		//     so that we do not know if the new value will make any difference, or
+		// (2) we have value cached before and they are different from new value.
+		if isExplicitSet {
+			if err == freecache.ErrNotFound ||
+				(err == nil && !bytes.Equal(ve.ValueBytes, memValue)) {
+				c.broadcastKeyInvalidate(storeKey(key))
+			}
 		}
 		// ignore in memory cache error
 		err = c.inMemCache.Set([]byte(storeKey(key)), ve.ValueBytes, int(ttl))
@@ -592,7 +597,7 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 				}
 				c.recordLatency(hitLabelRedis, startedAt)
 				if !noStore {
-					c.updateMemoryCache(key, ve)
+					c.updateMemoryCache(key, ve, false)
 				}
 				return ve.ValueBytes, nil
 			}
@@ -657,7 +662,7 @@ func (c *DCache) Set(ctx context.Context, key string, val any, ttl time.Duration
 	if err != nil {
 		return
 	}
-	err = c.setKey(ctx, key, bs, ttl)
+	err = c.setKey(ctx, key, bs, ttl, true)
 	return
 }
 
