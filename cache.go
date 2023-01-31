@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -55,8 +56,10 @@ var (
 	ErrTimeout = errors.New("timeout")
 	// ErrInternal should never happen
 	ErrInternal = errors.New("internal")
-	// ErrNil is an internal error for
-	ErrNil = errors.New("nil")
+	// ErrNotPointer value passed to get functions is not a pointer.
+	ErrNotPointer = errors.New("value is not a pointer")
+	// ErrTypeMismatch value passed to get functions is not a pointer.
+	ErrTypeMismatch = errors.New("value type mismatches cached type")
 )
 
 // SetNowFunc is a helper function to replace time.Now(), usually used for testing.
@@ -81,7 +84,10 @@ type Cache interface {
 	// cache it in both the memory and Redis by @p ttl.
 	// Inputs:
 	// @p key:     Key used in cache
-	// @p target:  A pointer to receive value, the value must be nil. (typed nil pointer)
+	// @p value:   A pointer to the memory piece of the type of the value.
+	//             For example, if we are caching string, then target must be of type *string.
+	//             if we caching a null-able string, using *string to represent it, then the
+	//             target must be of type **string, i.e., pointer to the pointer of string.
 	// @p ttl:     Expiration of cache key
 	// @p read:    Actual call that hits underlying data source.
 	// @p noCache: The response value will be fetched through @p read(). The new value will be
@@ -95,7 +101,10 @@ type Cache interface {
 	// cache it in both the memory and Redis by the ttl returned in @p read.
 	// Inputs:
 	// @p key:     Key used in cache
-	// @p value:   A pointer to receive value, the value must be nil. (typed nil pointer)
+	// @p value:   A pointer to the memory piece of the type of the value.
+	//             For example, if we are caching string, then target must be of type *string.
+	//             if we caching a null-able string, using *string to represent it, then the
+	//             target must be of type **string, i.e., pointer to the pointer of string.
 	// @p read:    Actual call that hits underlying data source that also returns a ttl for cache.
 	// @p noCache: The response value will be fetched through @p read(). The new value will be
 	//             cached, unless @p noStore is specified.
@@ -596,7 +605,18 @@ func marshal(value interface{}) ([]byte, error) {
 // unmarshal @p b into @p value.
 // copy from https://github.com/go-redis/cache/blob/v8/cache.go
 func unmarshal(b []byte, value interface{}) error {
+	if reflect.ValueOf(value).Kind() != reflect.Ptr {
+		return ErrNotPointer
+	}
 	if len(b) == 0 {
+		// if we cache nil or any zero value, must set *value to
+		// the same zero value.
+		v := reflect.ValueOf(value)
+		if v.Elem().CanSet() {
+			v.Elem().Set(reflect.Zero(v.Elem().Type()))
+		} else {
+			return ErrTypeMismatch
+		}
 		return nil
 	}
 	switch value := value.(type) {

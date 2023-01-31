@@ -216,13 +216,13 @@ type data struct {
 	I int
 }
 
-func (suite *testSuite) TestCachePenetration() {
+func (suite *testSuite) TestCachePenetrationNil() {
 	ctx := context.Background()
 	queryKey := "test"
 	var vget *data
 	suite.mockRepo.On("ReadThrough").Return(nil, nil).Once()
 	err := suite.cacheRepo.Get(
-		ctx, queryKey, vget, Normal.ToDuration(), func() (interface{}, error) {
+		ctx, queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
 			return suite.mockRepo.ReadThrough()
 		}, false, false)
 	suite.NoError(err)
@@ -230,11 +230,32 @@ func (suite *testSuite) TestCachePenetration() {
 
 	// second time should not penetrate cache.
 	err = suite.cacheRepo.Get(
-		ctx, queryKey, vget, Normal.ToDuration(), func() (interface{}, error) {
+		ctx, queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
 			return suite.mockRepo.ReadThrough()
 		}, false, false)
 	suite.NoError(err)
 	suite.Equal((*data)(nil), vget)
+}
+
+func (suite *testSuite) TestCachePenetrationStringZeroValue() {
+	ctx := context.Background()
+	queryKey := "test"
+	var vget string = "abc"
+	suite.mockRepo.On("ReadThrough").Return("", nil).Once()
+	err := suite.cacheRepo.Get(
+		ctx, queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
+			return suite.mockRepo.ReadThrough()
+		}, false, false)
+	suite.NoError(err)
+	suite.Equal("", vget)
+
+	// second time should not penetrate cache.
+	err = suite.cacheRepo.Get(
+		ctx, queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
+			return suite.mockRepo.ReadThrough()
+		}, false, false)
+	suite.NoError(err)
+	suite.Equal("", vget)
 }
 
 func (suite *testSuite) TestCacheCompressionRate() {
@@ -274,10 +295,11 @@ func (suite *testSuite) TestCacheCompressionValue() {
 	suite.Equal(expected, vget)
 }
 
-func (suite *testSuite) TestCachedNilNotOverwriteTarget() {
+func (suite *testSuite) TestCachedNilMustOverwritePointerTarget() {
 	ctx := context.Background()
 	queryKey := "test"
-	vget := "previous_value"
+	vget := new(string)
+	*vget = "old_value"
 	suite.mockRepo.On("ReadThrough").Return(nil, nil).Once()
 	err := suite.cacheRepo.Get(
 		ctx, queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
@@ -286,8 +308,7 @@ func (suite *testSuite) TestCachedNilNotOverwriteTarget() {
 	suite.NoError(err)
 
 	// This is a known issue for now...
-	suite.NotEqual((*string)(nil), vget)
-	suite.Equal("previous_value", vget)
+	suite.Equal((*string)(nil), vget)
 }
 
 func (suite *testSuite) TestPopulateCacheWithExpire() {
