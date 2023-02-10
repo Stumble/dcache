@@ -595,9 +595,9 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 					c.tracer.TraceHitFrom(ctx, hitMem)
 				}
 				return
+			} else {
+				c.recordError(errLabelMemoryUnmarshalFailed)
 			}
-		} else {
-			c.recordError(errLabelMemoryUnmarshalFailed)
 		}
 	}
 
