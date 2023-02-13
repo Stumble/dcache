@@ -596,6 +596,7 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 				}
 				return
 			} else {
+				log.Ctx(ctx).Err(err).Msgf("Failed to unmarshal from memory cache for %s", key)
 				c.recordError(errLabelMemoryUnmarshalFailed)
 			}
 		}
@@ -624,6 +625,7 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 					}
 					return ve.ValueBytes, nil
 				} else {
+					log.Ctx(ctx).Err(err).Msgf("Failed to unmarshal from Redis for %s", key)
 					c.recordError(errLabelRedisUnmarshalFailed)
 				}
 			}
@@ -633,6 +635,7 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 			// If timeout or not cache-able error, another thread will obtain lock after sleep.
 			updated, err := c.conn.SetNX(ctx, lockKey(key), "", c.readInterval).Result()
 			if err != nil {
+				log.Ctx(ctx).Err(err).Msgf("Failed to get lock by SetNX for %s", key)
 				c.recordError(errLabelSetRedis)
 			}
 			if updated {
