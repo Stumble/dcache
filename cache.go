@@ -81,58 +81,6 @@ type ValueBytesExpiredAt struct {
 	ExpiredAt  int64  `msgpack:"e,omitempty"` // UNIX timestamp in Milliseconds.
 }
 
-// Cache interface here is only for backward compatibility.
-// It is not recommended to use this interface in your app, instead, use *DCache.
-type Cache interface {
-	// Get will read the value from cache if exists or call read() to retrieve the value and
-	// cache it in both the memory and Redis by @p ttl.
-	// Inputs:
-	// @p key:     Key used in cache
-	// @p value:   A pointer to the memory piece of the type of the value.
-	//             For example, if we are caching string, then target must be of type *string.
-	//             if we caching a null-able string, using *string to represent it, then the
-	//             target must be of type **string, i.e., pointer to the pointer of string.
-	// @p ttl:     Expiration of cache key
-	// @p read:    Actual call that hits underlying data source.
-	// @p noCache: The response value will be fetched through @p read(). The new value will be
-	//             cached, unless @p noStore is specified.
-	// @p noStore: The response value will not be saved into the cache.
-	Get(
-		ctx context.Context, key string, target any, ttl time.Duration,
-		read ReadFunc, noCache bool, noStore bool) error
-
-	// GetWithTtl will read the value from cache if exists or call @p read to retrieve the value and
-	// cache it in both the memory and Redis by the ttl returned in @p read.
-	// Inputs:
-	// @p key:     Key used in cache
-	// @p value:   A pointer to the memory piece of the type of the value.
-	//             For example, if we are caching string, then target must be of type *string.
-	//             if we caching a null-able string, using *string to represent it, then the
-	//             target must be of type **string, i.e., pointer to the pointer of string.
-	// @p read:    Actual call that hits underlying data source that also returns a ttl for cache.
-	// @p noCache: The response value will be fetched through @p read(). The new value will be
-	//             cached, unless @p noStore is specified.
-	// @p noStore: The response value will not be saved into the cache.
-	GetWithTtl(
-		ctx context.Context, key string, target any,
-		readWithTtl ReadWithTtlFunc, noCache bool, noStore bool) error
-
-	// Set explicitly set a cache key to a val
-	// Inputs:
-	// key	  - key to set
-	// val	  - val to set
-	// ttl    - ttl of key
-	Set(ctx context.Context, key string, val any, ttl time.Duration) error
-
-	// Invalidate explicitly invalidates a cache key
-	// Inputs:
-	// key    - key to invalidate
-	Invalidate(ctx context.Context, key string) error
-
-	// Close closes resources used by cache
-	Close()
-}
-
 type metricSet struct {
 	Hit     *prometheus.CounterVec
 	Latency *prometheus.HistogramVec
@@ -223,9 +171,8 @@ type DCache struct {
 	wg             sync.WaitGroup
 }
 
-var _ Cache = &DCache{}
-
 // NewDCache creates a new cache client with in-memory cache if not @p inMemCache not nil.
+// Cache MUST be explicitly closed by calling Close().
 // It will also register several Prometheus metrics to the default register.
 // @p readInterval specify the duration between each read per key.
 func NewDCache(

@@ -25,9 +25,9 @@ type testSuite struct {
 	suite.Suite
 	redisConn   redis.UniversalClient
 	inMemCache  *freecache.Cache
-	cacheRepo   Cache
+	cacheRepo   *DCache
 	inMemCache2 *freecache.Cache
-	cacheRepo2  Cache
+	cacheRepo2  *DCache
 	mockRepo    dummyMock
 }
 
