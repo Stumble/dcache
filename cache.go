@@ -317,13 +317,17 @@ func (c *DCache) recordError(label metricErrLabel) {
 	}
 }
 
+func (c *DCache) traceHit(ctx context.Context, hit hitFrom) {
+	if c.tracer != nil {
+		c.tracer.TraceHitFrom(ctx, hit)
+	}
+}
+
 // readValue read through using f and cache to @p key if no error and not @p noStore.
 // return the marshaled bytes if no error.
 func (c *DCache) readValue(
 	ctx context.Context, key string, f ReadWithTtlFunc, noStore bool) ([]byte, error) {
-	if c.tracer != nil {
-		c.tracer.TraceHitFrom(ctx, hitDB)
-	}
+	c.traceHit(ctx, hitDB)
 	// valueTtl is an internal helper struct that bundles value and ttl.
 	type valueTtl struct {
 		Val any
@@ -591,9 +595,7 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 			err = unmarshal(targetBytes, target)
 			if err == nil {
 				c.makeHitRecorder(hitLabelMemory, startedAt)()
-				if c.tracer != nil {
-					c.tracer.TraceHitFrom(ctx, hitMem)
-				}
+				c.traceHit(ctx, hitMem)
 				return
 			} else {
 				log.Ctx(ctx).Err(err).Msgf("Failed to unmarshal from memory cache for %s", key)
@@ -617,9 +619,7 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 					targetHasUnmarshalled = true
 					// Value was retrieved from Redis, backfill memory cache and return.
 					defer c.makeHitRecorder(hitLabelRedis, startedAt)()
-					if c.tracer != nil {
-						c.tracer.TraceHitFrom(ctx, hitRedis)
-					}
+					c.traceHit(ctx, hitRedis)
 					if !noStore {
 						c.updateMemoryCache(ctx, key, ve, false)
 					}
