@@ -5,8 +5,4 @@ A full-featured 2-layer (mem-redis) cache implementation.
 + Redis network IO pressure: memory cache with Redis queue events for invalidation.
 + Compression
 + Prometheus
-+ TODO: OpenTelementry (or OpenTracing, the legacy version).
-
-** Known Issue
-*** Cached nil value will not overwrite target
-see TestCachedNilNotOverwriteTarget.
++ OpenTelementry
