@@ -8,9 +8,10 @@ import (
 )
 
 type metricSet struct {
-	Hit     *prometheus.CounterVec
-	Latency *prometheus.HistogramVec
-	Error   *prometheus.CounterVec
+	Hit       *prometheus.CounterVec
+	Latency   *prometheus.HistogramVec
+	Error     *prometheus.CounterVec
+	RedisPool *prometheus.GaugeVec
 }
 
 type metricHitLabel string
@@ -33,6 +34,8 @@ var (
 	errLabelInvalidate            metricErrLabel = "invalidate_error"
 	errLabelMemoryUnmarshalFailed metricErrLabel = "mem_unmarshal_failed"
 	errLabelRedisUnmarshalFailed  metricErrLabel = "redis_unmarshal_failed"
+
+	redisLabels = []string{"name"}
 )
 
 func newMetricSet(appName string) *metricSet {
@@ -53,6 +56,11 @@ func newMetricSet(appName string) *metricSet {
 				Name: fmt.Sprintf("%s_dcache_error_total", appName),
 				Help: "how many internal errors happened",
 			}, errLabels),
+		RedisPool: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: fmt.Sprintf("%s_dcache_redis_pool", appName),
+				Help: "redis pool status",
+			}, redisLabels),
 	}
 }
 
@@ -69,10 +77,15 @@ func (m *metricSet) Register() {
 	if err != nil {
 		log.Err(err).Msgf("failed to register prometheus Error counter")
 	}
+	err = prometheus.Register(m.RedisPool)
+	if err != nil {
+		log.Err(err).Msgf("failed to register prometheus RedisPool gauge")
+	}
 }
 
 func (m *metricSet) Unregister() {
 	prometheus.Unregister(m.Hit)
 	prometheus.Unregister(m.Error)
 	prometheus.Unregister(m.Latency)
+	prometheus.Unregister(m.RedisPool)
 }

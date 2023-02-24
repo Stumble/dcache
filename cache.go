@@ -34,6 +34,9 @@ const (
 
 	// the maximum read interval to warn about inappropriately large value.
 	maxReadInterval = 3 * time.Second
+
+	// update redis connection pool status.
+	connPoolUpdateInterval = 1 * time.Second
 )
 
 // Hardcap for memory cache TTL, changeable for testing.
@@ -142,9 +145,10 @@ func NewDCache(
 	}
 	if inMemCache != nil {
 		c.pubsub = c.conn.Subscribe(ctx, redisCacheInvalidateTopic)
-		c.wg.Add(2)
+		c.wg.Add(3)
 		go c.aggregateSend()
 		go c.listenKeyInvalidate()
+		go c.updateMetrics()
 	}
 	return c, nil
 }
@@ -167,7 +171,7 @@ func (c *DCache) Close() {
 		}
 	}
 	c.cancel()  // should be no-op because pubsub has been closed.
-	c.wg.Wait() // wait aggregateSend and listenKeyValidate close.
+	c.wg.Wait() // wait aggregateSend, listenKeyValidate and updateMetrics close.
 
 	// unregister after all	go routines are closed.
 	if c.stats != nil {
@@ -387,6 +391,25 @@ func (c *DCache) listenKeyInvalidate() {
 				c.inMemCache.Del([]byte(key))
 			}
 		}(payload)
+	}
+}
+
+func (c *DCache) updateMetrics() {
+	defer c.wg.Done()
+	if c.stats == nil {
+		return
+	}
+	ticker := time.NewTicker(connPoolUpdateInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+		case <-c.ctx.Done():
+			return
+		}
+		stats := c.conn.PoolStats()
+		c.stats.RedisPool.WithLabelValues("total_conns").Set(float64(stats.TotalConns))
+		c.stats.RedisPool.WithLabelValues("idle_conns").Set(float64(stats.IdleConns))
 	}
 }
 

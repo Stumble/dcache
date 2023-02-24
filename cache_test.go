@@ -166,6 +166,24 @@ func (suite *testSuite) encodeByte(value interface{}) []byte {
 	return b
 }
 
+func (suite *testSuite) TestCloseCache() {
+	cache1, e := NewDCache("test", suite.redisConn, nil, time.Second, false, false)
+	suite.Require().Nil(e)
+	cache1.Close()
+
+	cache1, e = NewDCache("test", suite.redisConn, nil, time.Second, true, false)
+	suite.Require().Nil(e)
+	cache1.Close()
+
+	cache1, e = NewDCache("test", suite.redisConn, nil, time.Second, false, true)
+	suite.Require().Nil(e)
+	cache1.Close()
+
+	cache1, e = NewDCache("test", suite.redisConn, nil, time.Second, true, true)
+	suite.Require().Nil(e)
+	cache1.Close()
+}
+
 func (suite *testSuite) TestPopulateCache() {
 	ctx := context.Background()
 	queryKey := "test"
