@@ -145,9 +145,12 @@ func NewDCache(
 	}
 	if inMemCache != nil {
 		c.pubsub = c.conn.Subscribe(ctx, redisCacheInvalidateTopic)
-		c.wg.Add(3)
+		c.wg.Add(2)
 		go c.aggregateSend()
 		go c.listenKeyInvalidate()
+	}
+	if enableStats {
+		c.wg.Add(1)
 		go c.updateMetrics()
 	}
 	return c, nil
