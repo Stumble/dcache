@@ -183,18 +183,15 @@ func (c *DCache) Close() {
 }
 
 func (c *DCache) makeHitRecorder(label metricHitLabel, startedAt time.Time) func() {
-	return func() {
-		if c.stats != nil {
-			c.stats.Hit.WithLabelValues(string(label)).Inc()
-			c.stats.Latency.WithLabelValues(string(label)).Observe(
-				float64(getNow().UnixMilli() - startedAt.UnixMilli()))
-		}
+	if c.stats != nil {
+		return c.stats.MakeHitObserver(label, startedAt)
 	}
+	return func() {}
 }
 
 func (c *DCache) recordError(label metricErrLabel) {
 	if c.stats != nil {
-		c.stats.Error.WithLabelValues(string(label)).Inc()
+		c.stats.ObserveError(label)
 	}
 }
 
@@ -411,8 +408,7 @@ func (c *DCache) updateMetrics() {
 			return
 		}
 		stats := c.conn.PoolStats()
-		c.stats.RedisPool.WithLabelValues("total_conns").Set(float64(stats.TotalConns))
-		c.stats.RedisPool.WithLabelValues("idle_conns").Set(float64(stats.IdleConns))
+		c.stats.UpdateConnPoolStatus(stats.TotalConns, stats.IdleConns)
 	}
 }
 
