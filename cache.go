@@ -40,7 +40,8 @@ const (
 )
 
 // Hardcap for memory cache TTL, changeable for testing.
-var memCacheMaxTTLSeconds int64 = 5
+var defaultMemCacheMaxTTLSeconds int64 = 5
+var memCacheMaxTTLHardCapSeconds int64 = 120
 
 // compression constants
 const (
@@ -90,15 +91,16 @@ type DCache struct {
 	tracer       *tracer
 
 	// In memory cache related
-	inMemCache     *freecache.Cache
-	pubsub         *redis.PubSub
-	id             string
-	invalidateKeys map[string]struct{}
-	invalidateMu   *sync.Mutex
-	invalidateCh   chan struct{}
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
+	inMemCache            *freecache.Cache
+	memCacheMaxTTLSeconds int64
+	pubsub                *redis.PubSub
+	id                    string
+	invalidateKeys        map[string]struct{}
+	invalidateMu          *sync.Mutex
+	invalidateCh          chan struct{}
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	wg                    sync.WaitGroup
 }
 
 // NewDCache creates a new cache client with in-memory cache if not @p inMemCache not nil.
@@ -131,17 +133,18 @@ func NewDCache(
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &DCache{
-		conn:           primaryClient,
-		stats:          stats,
-		tracer:         tracer,
-		id:             uuid.NewV4().String(),
-		invalidateKeys: make(map[string]struct{}),
-		invalidateMu:   &sync.Mutex{},
-		invalidateCh:   make(chan struct{}, invalidateChSize),
-		inMemCache:     inMemCache,
-		readInterval:   readInterval,
-		ctx:            ctx,
-		cancel:         cancel,
+		conn:                  primaryClient,
+		stats:                 stats,
+		tracer:                tracer,
+		id:                    uuid.NewV4().String(),
+		invalidateKeys:        make(map[string]struct{}),
+		invalidateMu:          &sync.Mutex{},
+		invalidateCh:          make(chan struct{}, invalidateChSize),
+		inMemCache:            inMemCache,
+		memCacheMaxTTLSeconds: defaultMemCacheMaxTTLSeconds,
+		readInterval:          readInterval,
+		ctx:                   ctx,
+		cancel:                cancel,
 	}
 	if inMemCache != nil {
 		c.pubsub = c.conn.Subscribe(ctx, redisCacheInvalidateTopic)
@@ -180,6 +183,15 @@ func (c *DCache) Close() {
 	if c.stats != nil {
 		c.stats.Unregister()
 	}
+}
+
+func (c *DCache) SetMemCacheMaxTTLSeconds(ttl int64) error {
+	if (ttl <= 0) || (ttl > memCacheMaxTTLHardCapSeconds) {
+		return fmt.Errorf(
+			"invalid ttl: %d, should be in range (0, %d]", ttl, memCacheMaxTTLHardCapSeconds)
+	}
+	c.memCacheMaxTTLSeconds = ttl
+	return nil
 }
 
 func (c *DCache) makeHitRecorder(label metricHitLabel, startedAt time.Time) func() {
@@ -277,8 +289,8 @@ func (c *DCache) updateMemoryCache(
 	// update memory cache.
 	// sub-second TTL will be ignored for memory cache.
 	ttl := time.UnixMilli(ve.ExpiredAt).Unix() - getNow().Unix()
-	if ttl > memCacheMaxTTLSeconds {
-		ttl = memCacheMaxTTLSeconds
+	if ttl > c.memCacheMaxTTLSeconds {
+		ttl = c.memCacheMaxTTLSeconds
 	}
 	if c.inMemCache != nil && ttl > 0 {
 		memValue, err := c.inMemCache.Get([]byte(storeKey(key)))

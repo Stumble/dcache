@@ -783,3 +783,9 @@ func (suite *testSuite) TestInvalidateKeyAcrossPods() {
 	_, e = suite.inMemCache2.Get([]byte(storeKey(queryKey)))
 	suite.Equal(freecache.ErrNotFound, e)
 }
+
+func (suite *testSuite) TestSetMemCacheMaxTTlSeconds() {
+	suite.Require().Nil(suite.cacheRepo.SetMemCacheMaxTTLSeconds(1))
+	suite.Require().Error(suite.cacheRepo.SetMemCacheMaxTTLSeconds(0))
+	suite.Require().Error(suite.cacheRepo.SetMemCacheMaxTTLSeconds(1000000))
+}
