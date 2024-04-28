@@ -9,5 +9,5 @@ A full-featured 2-layer (mem-redis) cache implementation.
 
 ** Versions
 
-For `go-redis/v8` users, please use `v0.1.x`. 
-For `go-redis/v9` users, use `v0.2.x`
++ For `go-redis/v8` users, please use `v0.1.x`. 
++ For `go-redis/v9` users, use `v0.2.x`
