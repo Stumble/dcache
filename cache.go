@@ -11,7 +11,8 @@ import (
 	"time"
 
 	"github.com/coocood/freecache"
-	"github.com/go-redis/redis/v8"
+	// "github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 	"github.com/klauspost/compress/s2"
 	"github.com/rs/zerolog/log"
 	uuid "github.com/satori/go.uuid"
