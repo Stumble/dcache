@@ -90,6 +90,10 @@ type DCache struct {
 	stats        *metricSet
 	tracer       *tracer
 
+	// enableRedisSingleFlight is a flag to enable single flight for Redis.
+	// It is disabled by default since v0.3.0.
+	enableRedisSingleFlight bool
+
 	// In memory cache related
 	inMemCache            *freecache.Cache
 	memCacheMaxTTLSeconds int64
@@ -103,6 +107,8 @@ type DCache struct {
 	wg                    sync.WaitGroup
 }
 
+type DacheOption func(*DCache)
+
 // NewDCache creates a new cache client with in-memory cache if not @p inMemCache not nil.
 // Cache MUST be explicitly closed by calling Close().
 // It will also register several Prometheus metrics to the default register.
@@ -114,6 +120,7 @@ func NewDCache(
 	readInterval time.Duration,
 	enableStats bool,
 	enableTracer bool,
+	options ...DacheOption,
 ) (*DCache, error) {
 	var stats *metricSet = nil
 	if enableStats {
@@ -133,19 +140,25 @@ func NewDCache(
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &DCache{
-		conn:                  primaryClient,
-		stats:                 stats,
-		tracer:                tracer,
-		id:                    uuid.NewV4().String(),
-		invalidateKeys:        make(map[string]struct{}),
-		invalidateMu:          &sync.Mutex{},
-		invalidateCh:          make(chan struct{}, invalidateChSize),
-		inMemCache:            inMemCache,
-		memCacheMaxTTLSeconds: defaultMemCacheMaxTTLSeconds,
-		readInterval:          readInterval,
-		ctx:                   ctx,
-		cancel:                cancel,
+		conn:                    primaryClient,
+		stats:                   stats,
+		tracer:                  tracer,
+		enableRedisSingleFlight: false,
+		id:                      uuid.NewV4().String(),
+		invalidateKeys:          make(map[string]struct{}),
+		invalidateMu:            &sync.Mutex{},
+		invalidateCh:            make(chan struct{}, invalidateChSize),
+		inMemCache:              inMemCache,
+		memCacheMaxTTLSeconds:   defaultMemCacheMaxTTLSeconds,
+		readInterval:            readInterval,
+		ctx:                     ctx,
+		cancel:                  cancel,
 	}
+	// apply options
+	for _, option := range options {
+		option(c)
+	}
+	// start pubsub if inMemCache is enabled.
 	if inMemCache != nil {
 		c.pubsub = c.conn.Subscribe(ctx, redisCacheInvalidateTopic)
 		c.wg.Add(2)
@@ -157,6 +170,11 @@ func NewDCache(
 		go c.updateMetrics()
 	}
 	return c, nil
+}
+
+// WithRedisSingleFlight enables single flight for Redis.
+func EnableRedisSingleFlightOption(c *DCache) {
+	c.enableRedisSingleFlight = true
 }
 
 // Ping checks if the underlying redis connection is alive
@@ -537,6 +555,20 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 					c.recordError(errLabelRedisUnmarshalFailed)
 				}
 			}
+			if !c.enableRedisSingleFlight {
+				// when redis single flight is disabled, we will just try to get value from DB, without
+				// acquiring lock. Note that if redis is down, we will not make any attempt to get value.
+				// We enforce this behavior by check if error is the redis.ErrNil.
+				if e != redis.Nil {
+					log.Ctx(ctx).Err(e).Msgf("Redis failed to response GET for %s", key)
+					c.recordError(errLabelSetRedis)
+					return nil, e
+				} else {
+					// Redis is okay, but value is not found, try to get value from DB.
+					return c.readValue(ctx, key, read, noStore)
+				}
+			}
+			// Redis single flight is enabled, we will try to get value from Redis, and if failed, we will
 			// If failed to retrieve value from Redis, try to get a lock and query DB.
 			// To avoid spamming Redis with SetNX requests, only one request should try to get
 			// the lock per-pod.

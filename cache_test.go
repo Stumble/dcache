@@ -10,7 +10,6 @@ import (
 
 	"github.com/coocood/freecache"
 	"github.com/redis/go-redis/v9"
-	// "github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 	"github.com/vmihailenco/msgpack/v5"
@@ -28,7 +27,12 @@ type testSuite struct {
 	cacheRepo   *DCache
 	inMemCache2 *freecache.Cache
 	cacheRepo2  *DCache
-	mockRepo    dummyMock
+	// redis single flight enabled cache
+	inMemCacheSf1 *freecache.Cache
+	cacheRepoSf1  *DCache
+	inMemCacheSf2 *freecache.Cache
+	cacheRepoSf2  *DCache
+	mockRepo      dummyMock
 }
 
 type dummyMock struct {
@@ -120,12 +124,27 @@ func newTestSuite() *testSuite {
 	if e != nil {
 		panic(e)
 	}
+	// max value size is: 100MB / 1024 = 100KB
+	inMemCacheSf1 := freecache.NewCache(1024 * 1024)
+	cacheRepoSf1, e := NewDCache("test", redisClient, inMemCacheSf1, time.Second, true, true, EnableRedisSingleFlightOption)
+	if e != nil {
+		panic(e)
+	}
+	inMemCacheSf2 := freecache.NewCache(1024 * 1024)
+	cacheRepoSf2, e := NewDCache("test", redisClient, inMemCacheSf2, time.Second, true, true, EnableRedisSingleFlightOption)
+	if e != nil {
+		panic(e)
+	}
 	return &testSuite{
-		redisConn:   redisClient,
-		cacheRepo:   cacheRepo,
-		inMemCache:  inMemCache,
-		cacheRepo2:  cacheRepo2,
-		inMemCache2: inMemCache2,
+		redisConn:     redisClient,
+		cacheRepo:     cacheRepo,
+		inMemCache:    inMemCache,
+		cacheRepo2:    cacheRepo2,
+		inMemCache2:   inMemCache2,
+		inMemCacheSf1: inMemCacheSf1,
+		cacheRepoSf1:  cacheRepoSf1,
+		inMemCacheSf2: inMemCacheSf2,
+		cacheRepoSf2:  cacheRepoSf2,
 	}
 }
 
@@ -136,6 +155,8 @@ func TestRepoTestSuite(t *testing.T) {
 func (suite *testSuite) BeforeTest(_, _ string) {
 	suite.inMemCache.Clear()
 	suite.inMemCache2.Clear()
+	suite.inMemCacheSf1.Clear()
+	suite.inMemCacheSf2.Clear()
 	suite.Require().NoError(suite.redisConn.FlushAll(context.Background()).Err())
 }
 
@@ -146,6 +167,8 @@ func (suite *testSuite) AfterTest(_, _ string) {
 func (suite *testSuite) TearDownSuite() {
 	suite.cacheRepo.Close()
 	suite.cacheRepo2.Close()
+	suite.cacheRepoSf1.Close()
+	suite.cacheRepoSf2.Close()
 }
 
 func (suite *testSuite) encodeByte(value interface{}) []byte {
@@ -428,7 +451,7 @@ func (suite *testSuite) TestNotCachingError() {
 	suite.Equal(v, vget)
 }
 
-func (suite *testSuite) TestConcurrentReadWait() {
+func (suite *testSuite) TestConcurrentReadWaitSingleFlight() {
 	queryKey := "test"
 	v := "testvalue"
 	// Only one pod should hit db
@@ -439,14 +462,14 @@ func (suite *testSuite) TestConcurrentReadWait() {
 	go func() {
 		defer wg.Done()
 		var vget string
-		err := suite.cacheRepo.Get(context.Background(), queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
+		err := suite.cacheRepoSf1.Get(context.Background(), queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
 			return suite.mockRepo.ReadThrough()
 		}, false, false)
 		suite.NoError(err)
 		suite.Equal(v, vget)
 	}()
 	var vget2 string
-	err := suite.cacheRepo2.Get(context.Background(), queryKey, &vget2, Normal.ToDuration(), func() (interface{}, error) {
+	err := suite.cacheRepoSf2.Get(context.Background(), queryKey, &vget2, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false, false)
 	suite.NoError(err)
@@ -628,13 +651,13 @@ func (suite *testSuite) TestDecodeToNil() {
 	suite.EqualValues(v, vget)
 }
 
-func (suite *testSuite) TestConcurrentReadAfterExpire() {
+func (suite *testSuite) TestConcurrentReadAfterExpireSingleFlight() {
 	queryKey := "test"
 	v := "testvalueold"
 	// Only one pod should hit db
 	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
 	var vget string
-	err := suite.cacheRepo.Get(context.Background(), queryKey, &vget, time.Second, func() (interface{}, error) {
+	err := suite.cacheRepoSf1.Get(context.Background(), queryKey, &vget, time.Second, func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false, false)
 	suite.NoError(err)
@@ -650,7 +673,7 @@ func (suite *testSuite) TestConcurrentReadAfterExpire() {
 	wg.Add(1)
 	go func() {
 		wg.Done()
-		err := suite.cacheRepo.Get(context.Background(), queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
+		err := suite.cacheRepoSf1.Get(context.Background(), queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
 			return suite.mockRepo.ReadThrough()
 		}, false, false)
 		suite.NoError(err)
@@ -658,7 +681,7 @@ func (suite *testSuite) TestConcurrentReadAfterExpire() {
 	}()
 	// Make sure cache2 is called later and timeout is within db response time
 	time.Sleep(dbResponseTime / 2)
-	err = suite.cacheRepo2.Get(context.Background(), queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
+	err = suite.cacheRepoSf2.Get(context.Background(), queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false, false)
 	suite.NoError(err)
@@ -667,7 +690,7 @@ func (suite *testSuite) TestConcurrentReadAfterExpire() {
 
 	time.Sleep(dbResponseTime)
 	// Should get newv afterwards
-	err = suite.cacheRepo.Get(context.Background(), queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
+	err = suite.cacheRepoSf1.Get(context.Background(), queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false, false)
 	suite.NoError(err)
