@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	lockSuffix = "_LOCK"
-	delimiter  = "~|~"
+	lockSuffix       = "_LOCK"
+	delimiter        = "~|~"
+	appNameDelimiter = ":"
 
 	// Duration to sleep before try to get another distributed lock for single flight.
 	lockSleep = 50 * time.Millisecond
@@ -84,6 +85,7 @@ type ValueBytesExpiredAt struct {
 
 // DCache implements cache.
 type DCache struct {
+	appName      string
 	conn         redis.UniversalClient
 	readInterval time.Duration
 	group        singleflight.Group
@@ -140,6 +142,7 @@ func NewDCache(
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &DCache{
+		appName:                 appName,
 		conn:                    primaryClient,
 		stats:                   stats,
 		tracer:                  tracer,
@@ -282,7 +285,7 @@ func (c *DCache) setKey(ctx context.Context, key string, valueBytes []byte, ttl 
 	if err != nil {
 		return err
 	}
-	err = c.conn.Set(ctx, storeKey(key), veBytes, ttl).Err()
+	err = c.conn.Set(ctx, c.storeKey(key), veBytes, ttl).Err()
 	if err != nil {
 		return err
 	}
@@ -292,7 +295,7 @@ func (c *DCache) setKey(ctx context.Context, key string, valueBytes []byte, ttl 
 
 // tryReadFromRedis try to read value from Redis.
 func (c *DCache) tryReadFromRedis(ctx context.Context, key string) (*ValueBytesExpiredAt, error) {
-	veBytes, err := c.conn.Get(ctx, storeKey(key)).Bytes()
+	veBytes, err := c.conn.Get(ctx, c.storeKey(key)).Bytes()
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +314,7 @@ func (c *DCache) updateMemoryCache(
 		ttl = c.memCacheMaxTTLSeconds
 	}
 	if c.inMemCache != nil && ttl > 0 {
-		memValue, err := c.inMemCache.Get([]byte(storeKey(key)))
+		memValue, err := c.inMemCache.Get([]byte(c.storeKey(key)))
 		// Broadcast invalidation request only when value is explicitly set to new one,
 		// by Set(), instead of backfilled from Redis, and if
 		// (1) The value does not exist before
@@ -320,13 +323,13 @@ func (c *DCache) updateMemoryCache(
 		if isExplicitSet {
 			if err == freecache.ErrNotFound ||
 				(err == nil && !bytes.Equal(ve.ValueBytes, memValue)) {
-				c.broadcastKeyInvalidate(storeKey(key))
+				c.broadcastKeyInvalidate(c.storeKey(key))
 			}
 		}
 		// ignore in memory cache error
-		err = c.inMemCache.Set([]byte(storeKey(key)), ve.ValueBytes, int(ttl))
+		err = c.inMemCache.Set([]byte(c.storeKey(key)), ve.ValueBytes, int(ttl))
 		if err != nil {
-			log.Ctx(ctx).Err(err).Msgf("Failed to set memory cache for key %s", storeKey(key))
+			log.Ctx(ctx).Err(err).Msgf("Failed to set memory cache for key %s", c.storeKey(key))
 			c.recordError(errLabelSetMemCache)
 		}
 	}
@@ -334,13 +337,13 @@ func (c *DCache) updateMemoryCache(
 
 // deleteKey delete key in redis and inMemCache
 func (c *DCache) deleteKey(ctx context.Context, key string) error {
-	n, err := c.conn.Del(ctx, storeKey(key)).Result()
+	n, err := c.conn.Del(ctx, c.storeKey(key)).Result()
 	if err != nil {
 		return err
 	}
 	if n > 0 {
 		if c.inMemCache != nil {
-			c.inMemCache.Del([]byte(storeKey(key)))
+			c.inMemCache.Del([]byte(c.storeKey(key)))
 			c.broadcastKeyInvalidate(key)
 		}
 	}
@@ -350,7 +353,7 @@ func (c *DCache) deleteKey(ctx context.Context, key string) error {
 // broadcastKeyInvalidate pushes key into a list and wait for broadcast
 func (c *DCache) broadcastKeyInvalidate(key string) {
 	c.invalidateMu.Lock()
-	c.invalidateKeys[storeKey(key)] = struct{}{}
+	c.invalidateKeys[c.storeKey(key)] = struct{}{}
 	l := len(c.invalidateKeys)
 	c.invalidateMu.Unlock()
 	if l == maxInvalidate {
@@ -442,12 +445,12 @@ func (c *DCache) updateMetrics() {
 	}
 }
 
-func storeKey(key string) string {
-	return fmt.Sprintf(":{%s}", key)
+func (c *DCache) storeKey(key string) string {
+	return c.appName + appNameDelimiter + fmt.Sprintf("{%s}", key)
 }
 
-func lockKey(key string) string {
-	return fmt.Sprintf(":%s%s", storeKey(key), lockSuffix)
+func (c *DCache) lockKey(key string) string {
+	return c.storeKey(key) + lockSuffix
 }
 
 // Get will read the value from cache if exists or call read() to retrieve the value and
@@ -516,7 +519,7 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 	// lookup in memory cache, return only when unmarshal succeeded.
 	if c.inMemCache != nil {
 		var targetBytes []byte
-		targetBytes, err = c.inMemCache.Get([]byte(storeKey(key)))
+		targetBytes, err = c.inMemCache.Get([]byte(c.storeKey(key)))
 		if err == nil {
 			err = unmarshal(targetBytes, target)
 			if err == nil {
@@ -532,7 +535,7 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 
 	var anyTypedBytes any
 	var targetHasUnmarshalled bool
-	anyTypedBytes, err, _ = c.group.Do(lockKey(key), func() (any, error) {
+	anyTypedBytes, err, _ = c.group.Do(c.lockKey(key), func() (any, error) {
 		// distributed single flight to query db for value.
 		for {
 			ve, e := c.tryReadFromRedis(ctx, key)
@@ -573,7 +576,7 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 			// To avoid spamming Redis with SetNX requests, only one request should try to get
 			// the lock per-pod.
 			// If timeout or not cache-able error, another thread will obtain lock after sleep.
-			updated, err := c.conn.SetNX(ctx, lockKey(key), "", c.readInterval).Result()
+			updated, err := c.conn.SetNX(ctx, c.lockKey(key), "", c.readInterval).Result()
 			if err != nil {
 				log.Ctx(ctx).Err(err).Msgf("Failed to get lock by SetNX for %s", key)
 				c.recordError(errLabelSetRedis)

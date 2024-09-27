@@ -113,25 +113,26 @@ func newTestSuite() *testSuite {
 		Addr: fmt.Sprintf("127.0.0.1:6379"),
 		DB:   10,
 	})
+	appName := "test"
 	// max value size is: 100MB / 1024 = 100KB
 	inMemCache := freecache.NewCache(100 * 1024 * 1024)
-	cacheRepo, e := NewDCache("test", redisClient, inMemCache, time.Second, true, true)
+	cacheRepo, e := NewDCache(appName, redisClient, inMemCache, time.Second, true, true)
 	if e != nil {
 		panic(e)
 	}
 	inMemCache2 := freecache.NewCache(1024 * 1024)
-	cacheRepo2, e := NewDCache("test", redisClient, inMemCache2, time.Second, false, true)
+	cacheRepo2, e := NewDCache(appName, redisClient, inMemCache2, time.Second, false, true)
 	if e != nil {
 		panic(e)
 	}
 	// max value size is: 100MB / 1024 = 100KB
 	inMemCacheSf1 := freecache.NewCache(1024 * 1024)
-	cacheRepoSf1, e := NewDCache("test", redisClient, inMemCacheSf1, time.Second, true, true, EnableRedisSingleFlightOption)
+	cacheRepoSf1, e := NewDCache(appName, redisClient, inMemCacheSf1, time.Second, true, true, EnableRedisSingleFlightOption)
 	if e != nil {
 		panic(e)
 	}
 	inMemCacheSf2 := freecache.NewCache(1024 * 1024)
-	cacheRepoSf2, e := NewDCache("test", redisClient, inMemCacheSf2, time.Second, true, true, EnableRedisSingleFlightOption)
+	cacheRepoSf2, e := NewDCache(appName, redisClient, inMemCacheSf2, time.Second, true, true, EnableRedisSingleFlightOption)
 	if e != nil {
 		panic(e)
 	}
@@ -229,13 +230,13 @@ func (suite *testSuite) TestPopulateCache() {
 	suite.NoError(err)
 	suite.Equal(v, vget)
 
-	redisBytes, err := suite.redisConn.Get(ctx, storeKey(queryKey)).Bytes()
+	redisBytes, err := suite.redisConn.Get(ctx, suite.cacheRepo.storeKey(queryKey)).Bytes()
 	suite.Require().NoError(err)
 	vredis := &ValueBytesExpiredAt{}
 	suite.Require().NoError(msgpack.Unmarshal(redisBytes, vredis))
 	suite.Equal(ev, vredis.ValueBytes)
 
-	vinmem, e := suite.inMemCache.Get([]byte(storeKey(queryKey)))
+	vinmem, e := suite.inMemCache.Get([]byte(suite.cacheRepo.storeKey(queryKey)))
 	suite.Require().NoError(e)
 	suite.Equal(ev, vinmem)
 
@@ -247,7 +248,7 @@ func (suite *testSuite) TestPopulateCache() {
 	suite.NoError(err)
 	suite.Equal(v, vget2)
 
-	vinmem2, e := suite.inMemCache2.Get([]byte(storeKey(queryKey)))
+	vinmem2, e := suite.inMemCache2.Get([]byte(suite.cacheRepo.storeKey(queryKey)))
 	suite.NoError(e)
 	suite.Equal(ev, vinmem2)
 }
@@ -387,42 +388,42 @@ func (suite *testSuite) TestPopulateCacheWithExpire() {
 	suite.Equal(v2, vget2)
 
 	// get v1
-	redisBytes, err := suite.redisConn.Get(ctx, storeKey(queryKey1)).Bytes()
+	redisBytes, err := suite.redisConn.Get(ctx, suite.cacheRepo.storeKey(queryKey1)).Bytes()
 	suite.Require().NoError(err)
 	vredis := &ValueBytesExpiredAt{}
 	suite.Require().NoError(msgpack.Unmarshal(redisBytes, vredis))
 	suite.Equal(ev1, vredis.ValueBytes)
 
-	vinmem, e := suite.inMemCache.Get([]byte(storeKey(queryKey1)))
+	vinmem, e := suite.inMemCache.Get([]byte(suite.cacheRepo.storeKey(queryKey1)))
 	suite.NoError(e)
 	suite.Equal(ev1, vinmem)
 
 	// get v2
-	redisBytes, err = suite.redisConn.Get(ctx, storeKey(queryKey2)).Bytes()
+	redisBytes, err = suite.redisConn.Get(ctx, suite.cacheRepo.storeKey(queryKey2)).Bytes()
 	suite.Require().NoError(err)
 	suite.Require().NoError(msgpack.Unmarshal(redisBytes, vredis))
 	suite.Equal(ev2, vredis.ValueBytes)
 
-	vinmem, e = suite.inMemCache.Get([]byte(storeKey(queryKey2)))
+	vinmem, e = suite.inMemCache.Get([]byte(suite.cacheRepo.storeKey(queryKey2)))
 	suite.NoError(e)
 	suite.Equal(ev2, vinmem)
 
 	time.Sleep(time.Second * 2)
 
 	// get v1, not exist
-	redisExist := suite.redisConn.Exists(ctx, storeKey(queryKey1)).Val()
+	redisExist := suite.redisConn.Exists(ctx, suite.cacheRepo.storeKey(queryKey1)).Val()
 	suite.EqualValues(redisExist, 0)
 
-	_, e = suite.inMemCache.Get([]byte(storeKey(queryKey1)))
+	_, e = suite.inMemCache.Get([]byte(suite.cacheRepo.storeKey(queryKey1)))
 	suite.Error(e)
 
 	// get v2
-	redisBytes, err = suite.redisConn.Get(ctx, storeKey(queryKey2)).Bytes()
+	redisBytes, err = suite.redisConn.Get(ctx, suite.cacheRepo.storeKey(queryKey2)).Bytes()
 	suite.Require().NoError(err)
 	suite.Require().NoError(msgpack.Unmarshal(redisBytes, vredis))
 	suite.Equal(ev2, vredis.ValueBytes)
 
-	vinmem, e = suite.inMemCache.Get([]byte(storeKey(queryKey2)))
+	vinmem, e = suite.inMemCache.Get([]byte(suite.cacheRepo.storeKey(queryKey2)))
 	suite.NoError(e)
 	suite.Equal(ev2, vinmem)
 }
@@ -717,11 +718,11 @@ func (suite *testSuite) TestInvalidate() {
 
 	// Wait for key to be deleted
 	time.Sleep(waitTime)
-	exist, e := suite.redisConn.Exists(context.Background(), storeKey(queryKey)).Result()
+	exist, e := suite.redisConn.Exists(context.Background(), suite.cacheRepo.storeKey(queryKey)).Result()
 	suite.NoError(e)
 	suite.EqualValues(0, exist)
 
-	_, e = suite.inMemCache.Get([]byte(storeKey(queryKey)))
+	_, e = suite.inMemCache.Get([]byte(suite.cacheRepo.storeKey(queryKey)))
 	suite.Equal(freecache.ErrNotFound, e)
 }
 
@@ -742,13 +743,13 @@ func (suite *testSuite) TestSet() {
 	err = suite.cacheRepo.Set(context.Background(), queryKey, newv, Normal.ToDuration())
 	suite.NoError(err)
 
-	redisBytes, err := suite.redisConn.Get(context.Background(), storeKey(queryKey)).Bytes()
+	redisBytes, err := suite.redisConn.Get(context.Background(), suite.cacheRepo.storeKey(queryKey)).Bytes()
 	suite.Require().NoError(err)
 	vredis := &ValueBytesExpiredAt{}
 	suite.Require().NoError(msgpack.Unmarshal(redisBytes, vredis))
 	suite.Equal(newve, vredis.ValueBytes)
 
-	vinmem, e := suite.inMemCache.Get([]byte(storeKey(queryKey)))
+	vinmem, e := suite.inMemCache.Get([]byte(suite.cacheRepo.storeKey(queryKey)))
 	suite.Require().NoError(e)
 	suite.Equal(newve, vinmem)
 
@@ -781,11 +782,11 @@ func (suite *testSuite) TestInvalidateKeyAcrossPods() {
 	suite.NoError(err)
 	suite.Equal(v, vget2)
 
-	vinmem, e := suite.inMemCache2.Get([]byte(storeKey(queryKey)))
+	vinmem, e := suite.inMemCache2.Get([]byte(suite.cacheRepo2.storeKey(queryKey)))
 	suite.NoError(e)
 	suite.Equal(ve, vinmem)
 
-	vinmem, e = suite.inMemCache2.Get([]byte(storeKey(queryKey)))
+	vinmem, e = suite.inMemCache2.Get([]byte(suite.cacheRepo2.storeKey(queryKey)))
 	suite.NoError(e)
 	suite.Equal(ve, vinmem)
 
@@ -795,15 +796,15 @@ func (suite *testSuite) TestInvalidateKeyAcrossPods() {
 
 	// Wait for key to be broadcasted
 	time.Sleep(time.Second)
-	exist, e := suite.redisConn.Exists(context.Background(), storeKey(queryKey)).Result()
+	exist, e := suite.redisConn.Exists(context.Background(), suite.cacheRepo.storeKey(queryKey)).Result()
 	suite.NoError(e)
 	suite.EqualValues(0, exist)
 
-	_, e = suite.inMemCache.Get([]byte(storeKey(queryKey)))
+	_, e = suite.inMemCache.Get([]byte(suite.cacheRepo.storeKey(queryKey)))
 	suite.Equal(freecache.ErrNotFound, e)
 
 	// check inmemcache of second pod is invalidated too
-	_, e = suite.inMemCache2.Get([]byte(storeKey(queryKey)))
+	_, e = suite.inMemCache2.Get([]byte(suite.cacheRepo2.storeKey(queryKey)))
 	suite.Equal(freecache.ErrNotFound, e)
 }
 
@@ -811,4 +812,12 @@ func (suite *testSuite) TestSetMemCacheMaxTTlSeconds() {
 	suite.Require().Nil(suite.cacheRepo.SetMemCacheMaxTTLSeconds(1))
 	suite.Require().Error(suite.cacheRepo.SetMemCacheMaxTTLSeconds(0))
 	suite.Require().Error(suite.cacheRepo.SetMemCacheMaxTTLSeconds(1000000))
+}
+
+func (suite *testSuite) TestStoreKey() {
+	suite.Equal("test:{test}", suite.cacheRepo.storeKey("test"))
+}
+
+func (suite *testSuite) TestLockKey() {
+	suite.Equal("test:{test}_LOCK", suite.cacheRepo.lockKey("test"))
 }
