@@ -9,10 +9,16 @@ import (
 	"time"
 
 	"github.com/coocood/freecache"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 	"github.com/vmihailenco/msgpack/v5"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 var (
@@ -282,7 +288,7 @@ func (suite *testSuite) TestCachePenetrationNil() {
 func (suite *testSuite) TestCachePenetrationStringZeroValue() {
 	ctx := context.Background()
 	queryKey := "test"
-	var vget string = "abc"
+	var vget = "abc"
 	suite.mockRepo.On("ReadThrough").Return("", nil).Once()
 	err := suite.cacheRepo.Get(
 		ctx, queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
@@ -673,12 +679,14 @@ func (suite *testSuite) TestConcurrentReadAfterExpireSingleFlight() {
 	suite.mockRepo.On("ReadThrough").Return(newv, nil).Once()
 	wg.Add(1)
 	go func() {
-		wg.Done()
-		err := suite.cacheRepoSf1.Get(context.Background(), queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
+		defer wg.Done()
+		// Use a separate target: the main goroutine reads concurrently.
+		var vgetAsync string
+		err := suite.cacheRepoSf1.Get(context.Background(), queryKey, &vgetAsync, Normal.ToDuration(), func() (interface{}, error) {
 			return suite.mockRepo.ReadThrough()
 		}, false, false)
 		suite.NoError(err)
-		suite.Equal(newv, vget)
+		suite.Equal(newv, vgetAsync)
 	}()
 	// Make sure cache2 is called later and timeout is within db response time
 	time.Sleep(dbResponseTime / 2)
@@ -820,4 +828,249 @@ func (suite *testSuite) TestStoreKey() {
 
 func (suite *testSuite) TestLockKey() {
 	suite.Equal("test:{test}_LOCK", suite.cacheRepo.lockKey("test"))
+}
+
+// Set on one pod must invalidate the memory cache of other pods.
+func (suite *testSuite) TestSetInvalidatesKeyAcrossPods() {
+	queryKey := "test"
+	v := "testvalueold"
+	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
+	var vget string
+	err := suite.cacheRepo.Get(context.Background(), queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
+		return suite.mockRepo.ReadThrough()
+	}, false, false)
+	suite.Require().NoError(err)
+
+	// second pod backfills its memory cache from Redis.
+	var vget2 string
+	err = suite.cacheRepo2.Get(context.Background(), queryKey, &vget2, Normal.ToDuration(), func() (interface{}, error) {
+		return suite.mockRepo.ReadThrough()
+	}, false, false)
+	suite.Require().NoError(err)
+	_, e := suite.inMemCache2.Get([]byte(suite.cacheRepo2.storeKey(queryKey)))
+	suite.Require().NoError(e)
+
+	err = suite.cacheRepo.Set(context.Background(), queryKey, "testvaluenew", Normal.ToDuration())
+	suite.Require().NoError(err)
+
+	// Wait for the invalidation to be broadcast.
+	time.Sleep(1500 * time.Millisecond)
+	_, e = suite.inMemCache2.Get([]byte(suite.cacheRepo2.storeKey(queryKey)))
+	suite.Equal(freecache.ErrNotFound, e, "second pod must drop its stale value after Set")
+}
+
+// Invalidate must clear memory caches even when the key is already gone from Redis.
+func (suite *testSuite) TestInvalidateWhenRedisKeyMissing() {
+	queryKey := "test"
+	v := "testvalue"
+	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
+	var vget string
+	err := suite.cacheRepo.Get(context.Background(), queryKey, &vget, Normal.ToDuration(), func() (interface{}, error) {
+		return suite.mockRepo.ReadThrough()
+	}, false, false)
+	suite.Require().NoError(err)
+	var vget2 string
+	err = suite.cacheRepo2.Get(context.Background(), queryKey, &vget2, Normal.ToDuration(), func() (interface{}, error) {
+		return suite.mockRepo.ReadThrough()
+	}, false, false)
+	suite.Require().NoError(err)
+
+	// The Redis copy disappears (expiry, eviction, manual delete) while memory caches still hold it.
+	suite.Require().NoError(suite.redisConn.Del(context.Background(), suite.cacheRepo.storeKey(queryKey)).Err())
+
+	suite.Require().NoError(suite.cacheRepo.Invalidate(context.Background(), queryKey))
+	_, e := suite.inMemCache.Get([]byte(suite.cacheRepo.storeKey(queryKey)))
+	suite.Equal(freecache.ErrNotFound, e, "local memory cache must be cleared")
+
+	time.Sleep(1500 * time.Millisecond)
+	_, e = suite.inMemCache2.Get([]byte(suite.cacheRepo2.storeKey(queryKey)))
+	suite.Equal(freecache.ErrNotFound, e, "other pods must be told to drop the key")
+}
+
+// newUnreachableClient returns a Redis client that fails fast on every command.
+func newUnreachableClient() *redis.Client {
+	return redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:1",
+		DialTimeout: 50 * time.Millisecond,
+		MaxRetries:  -1,
+	})
+}
+
+// Invalidate must clear the local memory cache even when Redis is unavailable.
+func (suite *testSuite) TestInvalidateClearsLocalMemoryWhenRedisFails() {
+	client := newUnreachableClient()
+	defer client.Close()
+	mem := freecache.NewCache(1024 * 1024)
+	c, err := NewDCache("invalidate-redis-down", client, mem, time.Second, false, false)
+	suite.Require().NoError(err)
+	defer c.Close()
+
+	key := c.storeKey("k")
+	suite.Require().NoError(mem.Set([]byte(key), []byte("stale"), 60))
+
+	err = c.Invalidate(context.Background(), "k")
+	suite.Error(err, "the Redis failure is still reported")
+	_, e := mem.Get([]byte(key))
+	suite.Equal(freecache.ErrNotFound, e, "local memory cache must be cleared")
+}
+
+// metricValue returns the summed value of a counter, or the sample sum of a
+// histogram, across series whose labels include all of want.
+func metricValue(t *testing.T, name string, want map[string]string) (float64, bool) {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var total float64
+	found := false
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+	metrics:
+		for _, m := range f.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			for k, v := range want {
+				if labels[k] != v {
+					continue metrics
+				}
+			}
+			found = true
+			switch {
+			case m.GetCounter() != nil:
+				total += m.GetCounter().GetValue()
+			case m.GetHistogram() != nil:
+				total += m.GetHistogram().GetSampleSum()
+			case m.GetGauge() != nil:
+				total += m.GetGauge().GetValue()
+			}
+		}
+	}
+	return total, found
+}
+
+// Several caches in one process must all export metrics, and closing one must
+// not stop the others from exporting.
+func (suite *testSuite) TestMetricsSharedAcrossCaches() {
+	t := suite.T()
+	a, err := NewDCache("metrics-a", suite.redisConn, nil, time.Second, true, false)
+	suite.Require().NoError(err)
+	defer a.Close()
+	b, err := NewDCache("metrics-b", suite.redisConn, nil, time.Second, true, false)
+	suite.Require().NoError(err)
+
+	read := func() (any, error) { return "v", nil }
+	var got string
+	suite.Require().NoError(a.Get(context.Background(), "ka", &got, Normal.ToDuration(), read, false, false))
+	suite.Require().NoError(b.Get(context.Background(), "kb", &got, Normal.ToDuration(), read, false, false))
+
+	_, found := metricValue(t, "dcache_hit_total", map[string]string{"app": "metrics-a"})
+	suite.True(found, "metrics-a hits must be exported")
+	_, found = metricValue(t, "dcache_hit_total", map[string]string{"app": "metrics-b"})
+	suite.True(found, "metrics-b hits must be exported")
+
+	b.Close()
+	suite.Require().NoError(a.Get(context.Background(), "ka2", &got, Normal.ToDuration(), read, false, false))
+	_, found = metricValue(t, "dcache_hit_total", map[string]string{"app": "metrics-a"})
+	suite.True(found, "closing one cache must not unregister another cache's metrics")
+}
+
+// A failed Redis GET is counted as get_redis, not set_redis.
+func (suite *testSuite) TestRedisGetFailureLabel() {
+	t := suite.T()
+	client := newUnreachableClient()
+	defer client.Close()
+	c, err := NewDCache("get-failure-label", client, nil, time.Second, true, false)
+	suite.Require().NoError(err)
+	defer c.Close()
+
+	var got string
+	err = c.Get(context.Background(), "k", &got, Normal.ToDuration(), func() (any, error) { return "v", nil }, false, false)
+	suite.Error(err)
+	v, _ := metricValue(t, "dcache_error_total", map[string]string{"app": "get-failure-label", "when": "get_redis"})
+	suite.Equal(1.0, v)
+	v, _ = metricValue(t, "dcache_error_total", map[string]string{"app": "get-failure-label", "when": "set_redis"})
+	suite.Equal(0.0, v)
+}
+
+// A failed Publish of invalidated keys is counted instead of silently dropped.
+func (suite *testSuite) TestPublishFailureCounted() {
+	t := suite.T()
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 10})
+	mem := freecache.NewCache(1024 * 1024)
+	c, err := NewDCache("publish-failure", client, mem, time.Second, true, false)
+	suite.Require().NoError(err)
+	defer c.Close()
+
+	c.broadcastKeyInvalidate("k")
+	suite.Require().NoError(client.Close())
+	time.Sleep(1500 * time.Millisecond)
+
+	v, _ := metricValue(t, "dcache_error_total", map[string]string{"app": "publish-failure", "when": "publish_invalidate"})
+	suite.GreaterOrEqual(v, 1.0)
+}
+
+// Spans record the error returned to the caller.
+func TestTraceRecordsError(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	defer otel.SetTracerProvider(prev)
+
+	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 10})
+	defer client.Close()
+	c, err := NewDCache("trace-error", client, nil, time.Second, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	ctx, parent := tp.Tracer("test").Start(context.Background(), "parent")
+	readErr := errors.New("db down")
+	var got string
+	err = c.GetWithTtl(ctx, "k", &got, func() (any, time.Duration, error) { return nil, 0, readErr }, true, false)
+	parent.End()
+	if !errors.Is(err, readErr) {
+		t.Fatalf("expected read error, got %v", err)
+	}
+
+	var span sdktrace.ReadOnlySpan
+	for _, s := range recorder.Ended() {
+		if s.Name() == "GetWithTtl" {
+			span = s
+		}
+	}
+	if span == nil {
+		t.Fatal("GetWithTtl span not recorded")
+	}
+	if span.Status().Code != codes.Error {
+		t.Fatalf("span status = %v, want Error", span.Status().Code)
+	}
+}
+
+// Latency is recorded with sub-millisecond precision.
+func TestLatencySubMillisecond(t *testing.T) {
+	m := &metricSet{
+		AppName: "latency",
+		Latency: prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "test_latency", Buckets: latencyBucket}, hitLabels),
+	}
+	start := time.Unix(1000, 0)
+	SetNowFunc(func() time.Time { return start.Add(300 * time.Microsecond) })
+	defer SetNowFunc(time.Now)
+
+	m.MakeHitObserver(hitLabelMemory, start)()
+
+	var out dto.Metric
+	h := m.Latency.WithLabelValues("latency", string(hitLabelMemory)).(prometheus.Histogram)
+	if err := h.Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.GetHistogram().GetSampleSum(); got < 0.29 || got > 0.31 {
+		t.Fatalf("latency sum = %v ms, want 0.3", got)
+	}
 }

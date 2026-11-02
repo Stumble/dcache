@@ -323,7 +323,7 @@ func (c *DCache) updateMemoryCache(
 		if isExplicitSet {
 			if err == freecache.ErrNotFound ||
 				(err == nil && !bytes.Equal(ve.ValueBytes, memValue)) {
-				c.broadcastKeyInvalidate(c.storeKey(key))
+				c.broadcastKeyInvalidate(key)
 			}
 		}
 		// ignore in memory cache error
@@ -335,19 +335,17 @@ func (c *DCache) updateMemoryCache(
 	}
 }
 
-// deleteKey delete key in redis and inMemCache
+// deleteKey deletes key in Redis and in the memory caches of all pods.
+// Memory caches are cleared even if the Redis delete fails or the key is
+// already gone from Redis, because pods may still hold a copy in memory.
+// The Redis error, if any, is returned.
 func (c *DCache) deleteKey(ctx context.Context, key string) error {
-	n, err := c.conn.Del(ctx, c.storeKey(key)).Result()
-	if err != nil {
-		return err
+	err := c.conn.Del(ctx, c.storeKey(key)).Err()
+	if c.inMemCache != nil {
+		c.inMemCache.Del([]byte(c.storeKey(key)))
+		c.broadcastKeyInvalidate(key)
 	}
-	if n > 0 {
-		if c.inMemCache != nil {
-			c.inMemCache.Del([]byte(c.storeKey(key)))
-			c.broadcastKeyInvalidate(key)
-		}
-	}
-	return nil
+	return err
 }
 
 // broadcastKeyInvalidate pushes key into a list and wait for broadcast
@@ -390,7 +388,14 @@ func (c *DCache) aggregateSend() {
 				keys = append(keys, key)
 			}
 			msg := c.id + delimiter + strings.Join(keys, delimiter)
-			c.conn.Publish(c.ctx, redisCacheInvalidateTopic, msg)
+			if err := c.conn.Publish(c.ctx, redisCacheInvalidateTopic, msg).Err(); err != nil {
+				if c.ctx.Err() != nil {
+					// Closing: the cache is going away, nothing left to invalidate for.
+					return
+				}
+				log.Err(err).Int("keys", len(keys)).Msg("failed to publish cache invalidation")
+				c.recordError(errLabelPublishInvalidate)
+			}
 		}()
 	}
 }
@@ -504,7 +509,7 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 				fmt.Sprintf("noCache=%v", noCache),
 				fmt.Sprintf("noStore=%v", noStore),
 			})
-		defer c.tracer.TraceEnd(ctx, err)
+		defer func() { c.tracer.TraceEnd(ctx, err) }()
 	}
 
 	if noCache {
@@ -554,7 +559,7 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 					}
 					return ve.ValueBytes, nil
 				} else {
-					log.Ctx(ctx).Err(err).Msgf("Failed to unmarshal from Redis for %s", key)
+					log.Ctx(ctx).Err(e).Msgf("Failed to unmarshal from Redis for %s", key)
 					c.recordError(errLabelRedisUnmarshalFailed)
 				}
 			}
@@ -564,7 +569,7 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 				// We enforce this behavior by check if error is the redis.ErrNil.
 				if e != redis.Nil {
 					log.Ctx(ctx).Err(e).Msgf("Redis failed to response GET for %s", key)
-					c.recordError(errLabelSetRedis)
+					c.recordError(errLabelGetRedis)
 					return nil, e
 				} else {
 					// Redis is okay, but value is not found, try to get value from DB.
@@ -612,7 +617,7 @@ func (c *DCache) GetWithTtl(ctx context.Context, key string, target any, read Re
 func (c *DCache) Invalidate(ctx context.Context, key string) (err error) {
 	if c.tracer != nil {
 		ctx = c.tracer.TraceStart(ctx, "Invalidate", []string{fmt.Sprintf("key=%s", key)})
-		defer c.tracer.TraceEnd(ctx, nil)
+		defer func() { c.tracer.TraceEnd(ctx, err) }()
 	}
 	err = c.deleteKey(ctx, key)
 	return
@@ -630,7 +635,7 @@ func (c *DCache) Set(ctx context.Context, key string, val any, ttl time.Duration
 				fmt.Sprintf("key=%s", key),
 				fmt.Sprintf("ttl=%s", ttl),
 			})
-		defer c.tracer.TraceEnd(ctx, err)
+		defer func() { c.tracer.TraceEnd(ctx, err) }()
 	}
 	bs, err := marshal(val)
 	if err != nil {
