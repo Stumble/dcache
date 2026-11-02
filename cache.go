@@ -684,7 +684,7 @@ func marshal(value interface{}) ([]byte, error) {
 // unmarshal @p b into @p value.
 // copy from https://github.com/go-redis/cache/blob/v8/cache.go
 func unmarshal(b []byte, value interface{}) error {
-	if reflect.ValueOf(value).Kind() != reflect.Ptr {
+	if reflect.ValueOf(value).Kind() != reflect.Pointer {
 		return ErrNotPointer
 	}
 	if len(b) == 0 {

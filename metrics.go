@@ -22,8 +22,11 @@ type metricSet struct {
 type metricHitLabel string
 type metricErrLabel string
 
+// labelApp is the label that carries the cache's app name on every metric.
+const labelApp = "app"
+
 var (
-	hitLabels = []string{"app", "hit"}
+	hitLabels = []string{labelApp, "hit"}
 	// metrics hit labels
 	hitLabelMemory metricHitLabel = "mem"
 	hitLabelRedis  metricHitLabel = "redis"
@@ -32,7 +35,7 @@ var (
 	latencyBucket = []float64{
 		1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}
 
-	errLabels = []string{"app", "when"}
+	errLabels = []string{labelApp, "when"}
 	// metrics error labels
 	errLabelSetRedis              metricErrLabel = "set_redis"
 	errLabelGetRedis              metricErrLabel = "get_redis"
@@ -42,7 +45,7 @@ var (
 	errLabelMemoryUnmarshalFailed metricErrLabel = "mem_unmarshal_failed"
 	errLabelRedisUnmarshalFailed  metricErrLabel = "redis_unmarshal_failed"
 
-	redisLabels = []string{"app", "name"}
+	redisLabels = []string{labelApp, "name"}
 )
 
 // The default registry identifies collectors by metric name, so all DCache
